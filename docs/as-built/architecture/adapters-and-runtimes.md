@@ -333,6 +333,22 @@ The native TUI is the only approval authority: the runner neither cancels
 for the bridge's identity frame instead of a `get_state` reply. Resume tokens
 stay the OMP session file, reported as `omp-tui_session_file`.
 
+Manual check (one seat in a tmux pane, after `npm run build -w packages/daemon`):
+
+```bash
+node dist/adapters/pi-runner.js --runtime omp --approval-mode yolo \
+  --session-name ompui-check@rig --state-root <seatRoot>/state \
+  --cwd <workdir> --launch-id attempt-1 --ui native
+```
+
+The pane must show OMP's own TUI (logo, model bar, composer), not a
+mirrored transcript. `<seatRoot>/runner.log` records "bridge socket
+listening at …", "waiting for the bridge to report the session identity" and
+then "READY session=…", and the sidecar `runner-state.json` gets
+`ready: true` with the OMP session file. A Rig message then arrives through
+the control role of that same socket and OMP answers in the same
+conversation; the pane is never typed into.
+
 
 `createDaemon` constructs the adapters (`startup.ts:778`, `:779`, `:782`,
 `:783`, `:788`) and creates the terminal adapter inline in the runtime adapter
