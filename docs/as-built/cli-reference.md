@@ -192,6 +192,12 @@ the sections that were not read are `null`.
 | `rig gateway human list` | — | `--json` |
 | `rig gateway human show <entityId>` | — | `--json` |
 | `rig gateway human set <entityId> <field> <value>` | — | `--reason <reason>`<br>`--actor <actor>` |
+| `rig gateway human mode` | — | — |
+| `rig gateway human mode save <entityId> <name>` | — | `--availability <value>`<br>`--expected-back <when>`<br>`--decision-room <words>`<br>`--exclude <item...>`<br>`--quiet <rule>`<br>`--tz <zone>`<br>`--account <where>`<br>`--actor <actor>`<br>`--json` |
+| `rig gateway human mode saved <entityId> [name]` | — | `--json` |
+| `rig gateway human mode apply <entityId> <name>` | — | `--until <time>`<br>`--tz <zone>`<br>`--actor <actor>`<br>`--json` |
+| `rig gateway human mode current <entityId>` | — | `--json` |
+| `rig gateway human mode end <entityId>` | — | `--scheduled`<br>`--actor <actor>`<br>`--json` |
 | `rig gateway human remove <entityId>` | — | `--force` |
 
 ### parked
