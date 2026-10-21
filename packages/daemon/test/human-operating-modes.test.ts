@@ -202,6 +202,62 @@ describe("applying and ending a mode", () => {
     expect(f.availability()).toBe("available");
   });
 
+  // Round 4 (F5): the legacy away flag, as the person's record has it.
+  const awayFlag = (home: string, id: string) => (readHumanAvailability(id, home) as { away: boolean }).away;
+
+  it("review F5: a legacy away the person had before the mode stays: still away after it ends, and the report says so", async () => {
+    const f = fixture();
+    expect(addHumanFragment(person("kim", { deliveryClass: "B", away: true }), f.home).ok).toBe(true);
+    await f.call("PUT", "kim/modes/away-from-desk", { availability: "away" });
+    const app = (await f.call("POST", "kim/modes/away-from-desk/apply", {})).body.application;
+    expect(app.effects[0]).toMatchObject({ consumer: "availability", state: "active", prior: { availability: null, away: true } });
+    const ended = (await f.call("POST", "kim/mode/end", {})).body.ended;
+    expect(ended.effects[0]).toMatchObject({ state: "ended", detail: "restored to not set; away stays on, as it was before the mode" });
+    expect(f.availability("kim")).toBeUndefined();
+    expect(awayFlag(f.home, "kim")).toBe(true);
+  });
+
+  it("review F5: an away flag set during the mode, over nothing authored before, is cleared: available again", async () => {
+    const f = fixture(); // sam: no availability, no flag
+    await f.call("PUT", "sam/modes/away-from-desk", { availability: "away" });
+    await f.call("POST", "sam/modes/away-from-desk/apply", {});
+    expect(setHumanField("sam", "away", "true", f.home).ok).toBe(true);
+    const ended = (await f.call("POST", "sam/mode/end", {})).body.ended;
+    expect(ended.effects[0]).toMatchObject({ state: "ended", detail: "restored to not set; the away flag set during it is cleared" });
+    expect(f.availability("sam")).toBeUndefined();
+    expect(awayFlag(f.home, "sam")).toBe(false);
+  });
+
+  it("review F5: R3-1 unchanged: an authored prior, away set during the mode, cleared and the prior restored", async () => {
+    const f = fixture(); // alex: available
+    await f.call("PUT", "alex/modes/away-from-desk", { availability: "away" });
+    await f.call("POST", "alex/modes/away-from-desk/apply", {});
+    expect(setHumanField("alex", "away", "true", f.home).ok).toBe(true);
+    const ended = (await f.call("POST", "alex/mode/end", {})).body.ended;
+    expect(stateOf(ended, "availability")).toBe("ended");
+    expect(f.availability()).toBe("available");
+    expect(awayFlag(f.home, "alex")).toBe(false);
+  });
+
+  it("review F5: a restore handed off at a switch carries the person's own away flag too", async () => {
+    const f = fixture();
+    expect(addHumanFragment(person("kim", { deliveryClass: "B", away: true }), f.home).ok).toBe(true);
+    const real = registryAvailability(f.home);
+    let failReads = 0;
+    const modes = new HumanModeService({ db: f.db, now: () => f.clock.now,
+      availability: { ...real, read: (id) => (failReads-- > 0 ? { ok: false, error: "registry unreadable (test)" } : real.read(id)) } });
+    modes.save("kim", { name: "away-from-desk", availability: { value: "away" } }, "op");
+    modes.save("kim", { name: "out-of-office", availability: { value: "away", expectedBack: "Monday" } }, "op");
+    const first = modes.apply("kim", "away-from-desk", {}, "op").application!;
+    failReads = 1; // the switch's end can't read the registry: the restore is owed, then handed off
+    const second = modes.apply("kim", "out-of-office", {}, "op").application!;
+    expect(second.effects[0]).toMatchObject({ state: "active", prior: { availability: null, away: true } });
+    expect(stateOf(modes.get(first.applicationId)!, "availability")).toBe("handed-off");
+    modes.end("kim", "back", "op");
+    expect(f.availability("kim")).toBeUndefined();
+    expect(awayFlag(f.home, "kim")).toBe(true);
+  });
+
   it("review R3-1: with no availability authored, `away` is the person's availability, so setting it is a change", () => {
     const f = fixture();
     const before = readHumanAvailability("sam", f.home) as { changeId: string };

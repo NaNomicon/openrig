@@ -76,8 +76,9 @@ export interface AvailabilityAccess {
   read(entityId: string): { ok: true; availability: string | undefined; changeId?: string | null; away?: boolean } | { ok: false; error: string };
   /** changeId: the change record this write left (also on an error after the fragment and record were written). */
   write(entityId: string, value: Availability | "unset"): { ok: true; changeId?: string } | { ok: false; error: string; changeId?: string };
-  /** Clear a legacy `away: true` that only agreed with an authored availability (a no-op for availability itself). */
-  clearAgreeingAway?(entityId: string): { ok: true } | { ok: false; error: string };
+  /** Set the legacy `away` flag: cleared when it only agreed with the mode's away, or put back on when the person had it
+   *  before the mode. */
+  setLegacyAway?(entityId: string, on: boolean): { ok: true } | { ok: false; error: string };
 }
 
 export function registryAvailability(home: string): AvailabilityAccess {
@@ -87,8 +88,8 @@ export function registryAvailability(home: string): AvailabilityAccess {
       const res = setHumanField(entityId, "availability", value, home);
       return res.ok ? { ok: true, changeId: res.changeId } : { ok: false, error: res.error, changeId: res.changeId };
     },
-    clearAgreeingAway: (entityId) => {
-      const res = setHumanField(entityId, "away", "false", home);
+    setLegacyAway: (entityId, on) => {
+      const res = setHumanField(entityId, "away", on ? "true" : "false", home);
       return res.ok ? { ok: true } : { ok: false, error: res.error };
     },
   };
@@ -213,7 +214,10 @@ export class HumanModeService {
         const after = wrote.changeId ? null : this.deps.availability.read(entityId);
         const landed = wrote.changeId ? { availability: value, changeId: wrote.changeId }
           : after?.ok && after.availability === value ? { availability: value, changeId: after.changeId ?? null } : null;
-        const priorValue = (owed?.effect.prior as { availability: string | null } | undefined) ?? { availability: prior.availability ?? null };
+        // The prior state is the authored availability and the legacy away flag, so ending can put back exactly what the
+        // person had (an inherited prior carries both).
+        const priorValue = (owed?.effect.prior as { availability: string | null; away?: boolean } | undefined)
+          ?? { availability: prior.availability ?? null, away: prior.away ?? false };
         if (wrote.ok && landed) this.effect(applicationId, "availability", priorValue, landed, "active", null);
         else this.effect(applicationId, "availability", priorValue, landed, "failed", wrote.ok ? "written, but it didn't read back as written" : wrote.error);
         if (owed && landed) this.handOff(owed, applicationId, mode.name, `availability ${priorValue.availability ?? "not set"}`);
@@ -325,7 +329,8 @@ export class HumanModeService {
   private endAvailability(entityId: string, applicationId: string, effect: ModeEffect): void {
     const identity = effect.changeIdentity as { availability: string; changeId?: string | null };
     const wrote = identity.availability;
-    const prior = (effect.prior as { availability: string | null }).availability;
+    // A snapshot without `away` (only in data from before the flag was recorded, never merged) reads as false.
+    const { availability: prior, away: priorAway = false } = effect.prior as { availability: string | null; away?: boolean };
     const now = this.deps.availability.read(entityId);
     if (!now.ok) {
       this.effect(applicationId, "availability", effect.prior, effect.changeIdentity, "pending", `couldn't read the current availability to check it's still this mode's: ${now.error}`);
@@ -340,19 +345,38 @@ export class HumanModeService {
         `changed since the mode started (now ${now.availability ?? "not set"}${now.availability === wrote ? ", set again since" : ""}); that choice stands`);
       return;
     }
-    // A legacy `away: true` the person set while the mode's away was on only agreed with it, and it would contradict the
-    // value being put back (the registry refuses the pair), so it goes first. With availability authored, clearing it
-    // changes nothing about availability and leaves the change record alone.
-    if (now.away && prior !== "away" && this.deps.availability.clearAgreeingAway) {
-      const cleared = this.deps.availability.clearAgreeingAway(entityId);
+    // A legacy `away: true` added while the mode's away was on only agreed with it, and it would contradict a value being
+    // put back (the registry refuses the pair), so it goes first, while availability is still authored (then clearing it
+    // changes nothing about availability and leaves the change record alone). A flag the person had before the mode stays:
+    // with nothing authored before, the person's own away is exactly what comes back.
+    const setAway = this.deps.availability.setLegacyAway;
+    if (now.away && !priorAway && prior !== "away" && setAway) {
+      const cleared = setAway(entityId, false);
       if (!cleared.ok) {
         this.effect(applicationId, "availability", effect.prior, effect.changeIdentity, "failed", `couldn't clear away before restoring ${prior ?? "not set"}: ${cleared.error}`);
         return;
       }
     }
     const restored = this.deps.availability.write(entityId, (prior ?? "unset") as Availability | "unset");
-    if (restored.ok) this.effect(applicationId, "availability", effect.prior, effect.changeIdentity, "ended", `restored to ${prior ?? "not set"}`);
-    else this.effect(applicationId, "availability", effect.prior, effect.changeIdentity, "failed", `couldn't restore ${prior ?? "not set"}: ${restored.error}`);
+    if (!restored.ok) {
+      this.effect(applicationId, "availability", effect.prior, effect.changeIdentity, "failed", `couldn't restore ${prior ?? "not set"}: ${restored.error}`);
+      return;
+    }
+    let detail = `restored to ${prior ?? "not set"}`;
+    if (prior === null && priorAway) {
+      // Their own legacy away from before the mode: put back on if it was cleared meanwhile (availability is unset now).
+      if (!now.away && setAway) {
+        const back = setAway(entityId, true);
+        if (!back.ok) {
+          this.effect(applicationId, "availability", effect.prior, effect.changeIdentity, "failed", `${detail}, but couldn't put away back on as it was before the mode: ${back.error}`);
+          return;
+        }
+      }
+      detail += "; away stays on, as it was before the mode";
+    } else if (now.away && !priorAway && prior !== "away") {
+      detail += "; the away flag set during it is cleared";
+    }
+    this.effect(applicationId, "availability", effect.prior, effect.changeIdentity, "ended", detail);
   }
 
   private endQuiet(entityId: string, applicationId: string, effect: ModeEffect, actor: string, at: Date): void {
