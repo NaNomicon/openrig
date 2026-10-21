@@ -47,7 +47,9 @@ export interface QuietBoundary {
 export type QuietState =
   | { active: false; nextBoundary: null }
   | { active: false; windowId: string; revision: number; nextBoundary: QuietBoundary | null }
-  | { active: true; windowId: string; revision: number; occurrence: string; nextBoundary: QuietBoundary };
+  /** occurrenceStart: when the occurrence that is on now began (a daily window's start that day; an until-window's
+   *  single occurrence begins when its rule was set). */
+  | { active: true; windowId: string; revision: number; occurrence: string; occurrenceStart: string; nextBoundary: QuietBoundary };
 
 interface Row {
   entity_id: string; window_id: string; revision: number; kind: "daily" | "until"; timezone: string;
@@ -126,7 +128,7 @@ export class HumanQuietStore {
     if (row.kind === "until") {
       const untilMs = Date.parse(row.until_at!);
       if (nowMs < untilMs && row.ended_occurrence !== "until") {
-        return { active: true, ...base, occurrence: "until", nextBoundary: { kind: "end", at: new Date(untilMs).toISOString() } };
+        return { active: true, ...base, occurrence: "until", occurrenceStart: row.set_at, nextBoundary: { kind: "end", at: new Date(untilMs).toISOString() } };
       }
       return { active: false, ...base, nextBoundary: null };
     }
@@ -141,7 +143,7 @@ export class HumanQuietStore {
       // A window wholly inside a skipped hour resolves both ends to the same instant: that night has no quiet at all.
       if (endMs <= startMs) continue;
       if (startMs <= nowMs && nowMs < endMs && row.ended_occurrence !== day) {
-        return { active: true, ...base, occurrence: day, nextBoundary: { kind: "end", at: new Date(endMs).toISOString() } };
+        return { active: true, ...base, occurrence: day, occurrenceStart: new Date(startMs).toISOString(), nextBoundary: { kind: "end", at: new Date(endMs).toISOString() } };
       }
       if (startMs > nowMs && (nextStart === null || startMs < nextStart)) nextStart = startMs;
     }

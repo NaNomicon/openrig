@@ -73,8 +73,11 @@ export class ModeError extends Error {
 /** The two writers a mode changes outside its own tables; tests inject failing ones. */
 export interface AvailabilityAccess {
   /** The authored value, and the id of the latest change recorded through the registry's writers (null: none yet). */
-  read(entityId: string): { ok: true; availability: string | undefined; changeId?: string | null } | { ok: false; error: string };
-  write(entityId: string, value: Availability | "unset"): { ok: true } | { ok: false; error: string };
+  read(entityId: string): { ok: true; availability: string | undefined; changeId?: string | null; away?: boolean } | { ok: false; error: string };
+  /** changeId: the change record this write left (also on an error after the fragment and record were written). */
+  write(entityId: string, value: Availability | "unset"): { ok: true; changeId?: string } | { ok: false; error: string; changeId?: string };
+  /** Clear a legacy `away: true` that only agreed with an authored availability (a no-op for availability itself). */
+  clearAgreeingAway?(entityId: string): { ok: true } | { ok: false; error: string };
 }
 
 export function registryAvailability(home: string): AvailabilityAccess {
@@ -82,6 +85,10 @@ export function registryAvailability(home: string): AvailabilityAccess {
     read: (entityId) => readHumanAvailability(entityId, home),
     write: (entityId, value) => {
       const res = setHumanField(entityId, "availability", value, home);
+      return res.ok ? { ok: true, changeId: res.changeId } : { ok: false, error: res.error, changeId: res.changeId };
+    },
+    clearAgreeingAway: (entityId) => {
+      const res = setHumanField(entityId, "away", "false", home);
       return res.ok ? { ok: true } : { ok: false, error: res.error };
     },
   };
@@ -198,11 +205,14 @@ export class HumanModeService {
           return prior.availability === id.availability && (id.changeId == null || prior.changeId === id.changeId);
         });
         const wrote = this.deps.availability.write(entityId, value);
-        // The change identity is the change record the write left (read back right after it) and the value. A write can
-        // also fail after the fragment is saved (re-projecting it fails); the value is then live on the next load, so if
-        // it's now the mode's, the change is still recorded as the mode's own and ending puts the prior value back.
-        const after = this.deps.availability.read(entityId);
-        const landed = after.ok && after.availability === value ? { availability: value, changeId: after.changeId ?? null } : null;
+        // The change identity is the change record the mode's own write left, as the writer returns it (so a manual write
+        // landing right after it is never taken for the mode's), with the value. A write can also fail after the fragment
+        // and record are saved (re-projecting it fails); its id comes back with the error, the value is live on the next
+        // load, and the change is still the mode's own, so ending puts the prior value back. A writer that returns no id
+        // (an injected one, or a record that couldn't be written) falls back to reading the record back after the write.
+        const after = wrote.changeId ? null : this.deps.availability.read(entityId);
+        const landed = wrote.changeId ? { availability: value, changeId: wrote.changeId }
+          : after?.ok && after.availability === value ? { availability: value, changeId: after.changeId ?? null } : null;
         const priorValue = (owed?.effect.prior as { availability: string | null } | undefined) ?? { availability: prior.availability ?? null };
         if (wrote.ok && landed) this.effect(applicationId, "availability", priorValue, landed, "active", null);
         else this.effect(applicationId, "availability", priorValue, landed, "failed", wrote.ok ? "written, but it didn't read back as written" : wrote.error);
@@ -237,7 +247,8 @@ export class HumanModeService {
       });
     }
     if (mode.decisionRoom) step("decision-room", () => this.effect(applicationId, "decision-room", null, { applicationId }, "active", null));
-    return { application: this.get(applicationId), ended };
+    // The switch's ended snapshot is read again, so it shows any effect this apply has since handed off.
+    return { application: this.get(applicationId), ended: ended ? this.get(ended.applicationId) : null };
   }
 
   /** End the person's active application: each effect ends only if the latest change is still its own. Returns the
@@ -329,6 +340,16 @@ export class HumanModeService {
         `changed since the mode started (now ${now.availability ?? "not set"}${now.availability === wrote ? ", set again since" : ""}); that choice stands`);
       return;
     }
+    // A legacy `away: true` the person set while the mode's away was on only agreed with it, and it would contradict the
+    // value being put back (the registry refuses the pair), so it goes first. With availability authored, clearing it
+    // changes nothing about availability and leaves the change record alone.
+    if (now.away && prior !== "away" && this.deps.availability.clearAgreeingAway) {
+      const cleared = this.deps.availability.clearAgreeingAway(entityId);
+      if (!cleared.ok) {
+        this.effect(applicationId, "availability", effect.prior, effect.changeIdentity, "failed", `couldn't clear away before restoring ${prior ?? "not set"}: ${cleared.error}`);
+        return;
+      }
+    }
     const restored = this.deps.availability.write(entityId, (prior ?? "unset") as Availability | "unset");
     if (restored.ok) this.effect(applicationId, "availability", effect.prior, effect.changeIdentity, "ended", `restored to ${prior ?? "not set"}`);
     else this.effect(applicationId, "availability", effect.prior, effect.changeIdentity, "failed", `couldn't restore ${prior ?? "not set"}: ${restored.error}`);
@@ -365,11 +386,14 @@ export class HumanModeService {
         }
         const state = this.quiet.quietStateFor(entityId, at);
         if (!state.active) return;
-        // Only tonight's mark carries: one for the current occurrence (an until-window has just the one while it lasts),
-        // never one the person left on an earlier night of a daily mode.
-        const tonight = <T extends { occurrence: string }>(ended: T | null | undefined): T | null =>
-          ended && (ended.occurrence === state.occurrence || ended.occurrence === "until") ? ended : null;
-        const mark = tonight(personEnded) ?? (prior?.ended && prior.ended.occurrence === state.occurrence ? prior.ended : null);
+        // A mark carries only if the person ended quiet within the occurrence that is on now: from its start up to now.
+        // Judged by time, not by the occurrence's label (the person's mark may be on a different rule's occurrence), so
+        // neither an earlier night's mark nor an old one from before this occurrence began carries. A restored
+        // until-window's one occurrence began when the prior rule was set (the restore itself writes a new set time).
+        const occurrenceStart = Date.parse(prior?.kind === "until" ? prior.setAt : state.occurrenceStart);
+        const tonight = <T extends { at: string }>(ended: T | null | undefined): T | null =>
+          ended && Date.parse(ended.at) >= occurrenceStart && Date.parse(ended.at) < at.getTime() ? ended : null;
+        const mark = tonight(personEnded) ?? tonight(prior?.ended);
         if (!mark) return;
         this.quiet.restoreEnded(entityId, state.revision, { occurrence: state.occurrence, by: mark.by, at: mark.at });
         detail += "; tonight stays off, as you set it";

@@ -455,8 +455,10 @@ export type ShowHumanResult =
   | { ok: false; error: string };
 
 export type SetHumanFieldResult =
-  | { ok: true; path: string; fragment: HumanFragment }
-  | { ok: false; error: string };
+  /** changeId: the availability change record this write left, when it left one. */
+  | { ok: true; path: string; fragment: HumanFragment; changeId?: string }
+  /** changeId: set when the fragment and its change record were written but something after them failed. */
+  | { ok: false; error: string; changeId?: string };
 
 export type RemoveHumanResult =
   | { ok: true; removed: string; archivedPath: string; orphanRecordPath?: string }
@@ -598,16 +600,17 @@ function handleConflict(fragment: HumanFragment, home: string): string | undefin
 function availabilityChangePath(entityId: string, home: string): string {
   return join(humansDir(home), ".availability", `${entityId}.json`);
 }
-function recordAvailabilityChange(entityId: string, home: string): { ok: true } | { ok: false; error: string } {
-  const w = atomicWrite(availabilityChangePath(entityId, home), JSON.stringify({ changeId: randomUUID(), at: new Date().toISOString() }));
-  return w.ok ? { ok: true } : { ok: false, error: `availability change record not written: ${w.error}` };
+function recordAvailabilityChange(entityId: string, home: string): { ok: true; changeId: string } | { ok: false; error: string } {
+  const changeId = randomUUID();
+  const w = atomicWrite(availabilityChangePath(entityId, home), JSON.stringify({ changeId, at: new Date().toISOString() }));
+  return w.ok ? { ok: true, changeId } : { ok: false, error: `availability change record not written: ${w.error}` };
 }
 
 /** The availability a person's fragment authors (undefined when it authors none), and the id of the latest change
  *  recorded through the writers (null when none has been): what a mode records as the prior value and checks is still
  *  its own. */
 export function readHumanAvailability(entityId: string, home: string = getOpenRigHome()):
-  { ok: true; availability: string | undefined; changeId: string | null } | { ok: false; error: string } {
+  { ok: true; availability: string | undefined; changeId: string | null; away: boolean } | { ok: false; error: string } {
   const f = readFragment(entityId, home);
   if (!f.ok) return f;
   const prefs = isObj(f.raw.prefs) ? (f.raw.prefs as Record<string, unknown>) : {};
@@ -622,7 +625,7 @@ export function readHumanAvailability(entityId: string, home: string = getOpenRi
       return { ok: false, error: `availability change record for ${entityId} is unreadable: ${(err as Error).message}` };
     }
   }
-  return { ok: true, availability: typeof prefs.availability === "string" ? prefs.availability : undefined, changeId };
+  return { ok: true, availability: typeof prefs.availability === "string" ? prefs.availability : undefined, changeId, away: prefs.away === true };
 }
 
 export function setHumanField(
@@ -684,13 +687,18 @@ export function setHumanField(
 
   const w = atomicWrite(f.path, stringifyYaml(raw));
   if (!w.ok) return { ok: false, error: w.error };
-  if (field === "availability" || field === "away") {
+  // A change to availability rotates the change record. Legacy `away` changes availability only while the fragment
+  // authors none: with availability authored, `away` must agree with it (true only when it's already away) or it's
+  // false, and either way availability is unchanged, so the record stays the latest real change's.
+  let changeId: string | undefined;
+  if (field === "availability" || (field === "away" && rawPrefs.availability === undefined)) {
     const change = recordAvailabilityChange(entityId, home);
     if (!change.ok) return { ok: false, error: `fragment written but ${change.error}` };
+    changeId = change.changeId;
   }
   const proj = writeProjection(home);
-  if (!proj.ok) return { ok: false, error: `fragment written but re-projection failed: ${proj.error}` };
-  return { ok: true, path: f.path, fragment: v.fragment };
+  if (!proj.ok) return { ok: false, error: `fragment written but re-projection failed: ${proj.error}`, ...(changeId ? { changeId } : {}) };
+  return { ok: true, path: f.path, fragment: v.fragment, ...(changeId ? { changeId } : {}) };
 }
 
 export function removeHumanFragment(

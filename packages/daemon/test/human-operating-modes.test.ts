@@ -186,6 +186,73 @@ describe("applying and ending a mode", () => {
     expect(f.quiet.quietStateFor("alex", f.clock.now).active, "quiet is off now").toBe(false);
   });
 
+  it("review R3-1: `away` set during a mode while availability is authored changes nothing, so ending still restores", async () => {
+    const f = fixture(); // alex: available
+    await f.call("PUT", "alex/modes/away-from-desk", { availability: "away" });
+    await f.call("POST", "alex/modes/away-from-desk/apply", {});
+    expect(setHumanField("alex", "away", "true", f.home).ok).toBe(true); // agrees with availability away: no change
+    let ended = (await f.call("POST", "alex/mode/end", {})).body.ended;
+    expect(stateOf(ended, "availability")).toBe("ended");
+    expect(f.availability()).toBe("available");
+    await f.call("PUT", "alex/modes/out-of-office", { availability: "off" });
+    await f.call("POST", "alex/modes/out-of-office/apply", {});
+    expect(setHumanField("alex", "away", "false", f.home).ok).toBe(true); // also no change to availability
+    ended = (await f.call("POST", "alex/mode/end", {})).body.ended;
+    expect(stateOf(ended, "availability")).toBe("ended");
+    expect(f.availability()).toBe("available");
+  });
+
+  it("review R3-1: with no availability authored, `away` is the person's availability, so setting it is a change", () => {
+    const f = fixture();
+    const before = readHumanAvailability("sam", f.home) as { changeId: string };
+    expect(setHumanField("sam", "away", "true", f.home).ok).toBe(true);
+    expect((readHumanAvailability("sam", f.home) as { changeId: string }).changeId).not.toBe(before.changeId);
+  });
+
+  it("review R3-2: the person's end carries by time across rules: a daily mode over a prior until-window, ended by hand, stays off", async () => {
+    const f = fixture("2026-10-20T20:30:00Z");
+    f.quiet.setUntil("alex", { until: new Date("2026-10-20T23:00:00Z"), timezone: "UTC", setBy: "alex", now: f.clock.now });
+    f.clock.now = new Date("2026-10-20T21:00:00Z");
+    await f.call("PUT", "alex/modes/asleep", { availability: "away", quiet: "20:00-08:00", timezone: "UTC" });
+    await f.call("POST", "alex/modes/asleep/apply", {});
+    f.clock.now = new Date("2026-10-20T21:15:00Z");
+    expect((await f.call("POST", "alex/quiet/end", {}, "alex")).status).toBe(200); // the mode's occurrence 2026-10-20
+    f.clock.now = new Date("2026-10-20T21:30:00Z");
+    const ended = (await f.call("POST", "alex/mode/end", {})).body.ended;
+    expect(ended.effects.find((e: Record<string, any>) => e.consumer === "quiet").detail).toMatch(/restored quiet hours until .*; tonight stays off, as you set it$/);
+    expect(f.quiet.show("alex")).toMatchObject({ kind: "until", until: "2026-10-20T23:00:00.000Z", ended: { occurrence: "until", by: "alex" } });
+    expect(f.quiet.quietStateFor("alex", f.clock.now).active).toBe(false);
+  });
+
+  it("review R3-2: a mark from before the restored occurrence began doesn't carry, even across rules", async () => {
+    const f = fixture("2026-10-20T18:30:00Z");
+    f.quiet.setDaily("alex", { start: "20:00", end: "08:00", timezone: "UTC", setBy: "alex", now: f.clock.now });
+    await f.call("PUT", "alex/modes/away-from-desk", { availability: "away", quiet: "until-end", timezone: "UTC" });
+    await f.call("POST", "alex/modes/away-from-desk/apply", { until: "23:30", timezone: "UTC" });
+    f.clock.now = new Date("2026-10-20T19:00:00Z");
+    expect((await f.call("POST", "alex/quiet/end", {}, "alex")).status).toBe(200); // ended the mode's quiet at 19:00
+    f.clock.now = new Date("2026-10-20T21:30:00Z");
+    const ended = (await f.call("POST", "alex/mode/end", {})).body.ended;
+    expect(ended.effects.find((e: Record<string, any>) => e.consumer === "quiet").detail).not.toMatch(/tonight stays off/);
+    expect(f.quiet.quietStateFor("alex", f.clock.now).active, "tonight's 20:00 occurrence began after that mark").toBe(true);
+  });
+
+  it("review R3-3: a manual write landing between the mode's write and its record isn't taken for the mode's; it's kept", async () => {
+    const f = fixture();
+    const real = registryAvailability(f.home);
+    let first = true;
+    const modes = new HumanModeService({ db: f.db, now: () => f.clock.now, availability: { read: real.read, write: (id, value) => {
+      const res = real.write(id, value);
+      if (first) { first = false; expect(setHumanField(id, "availability", "focus", f.home).ok).toBe(true); } // by hand, right after
+      return res;
+    } } });
+    modes.save("alex", { name: "away-from-desk", availability: { value: "away" } }, "op");
+    modes.apply("alex", "away-from-desk", {}, "op");
+    const ended = modes.end("alex", "back", "op")!;
+    expect(stateOf(ended, "availability")).toBe("kept");
+    expect(f.availability()).toBe("focus");
+  });
+
   it("an availability that wasn't authored before the mode is unauthored again after it", async () => {
     const f = fixture();
     await f.call("PUT", "sam/modes/away-from-desk", { availability: "away", timezone: "UTC" });
