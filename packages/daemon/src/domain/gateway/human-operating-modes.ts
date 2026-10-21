@@ -180,30 +180,43 @@ export class HumanModeService {
     this.deps.db.prepare(`INSERT INTO human_mode_applications (application_id, entity_id, mode_name, settings, started_by, started_at, scheduled_end)
       VALUES (?, ?, ?, ?, ?, ?, ?)`).run(applicationId, entityId, wanted, JSON.stringify(mode), actor, at.toISOString(), scheduledEnd?.toISOString() ?? null);
 
+    // Each effect is its own step: one that throws is recorded as that effect's failure and never stops the others, so the
+    // record always shows every effect's real state.
+    const step = (consumer: EffectConsumer, run: () => void) => {
+      try { run(); } catch (error) { this.effect(applicationId, consumer, null, null, "failed", `couldn't apply it: ${(error as Error).message}`); }
+    };
     if (mode.availability.value) {
       const value = mode.availability.value;
-      const prior = this.deps.availability.read(entityId);
-      if (!prior.ok) this.effect(applicationId, "availability", null, null, "failed", `couldn't read the current availability: ${prior.error}`);
-      else {
+      step("availability", () => {
+        const prior = this.deps.availability.read(entityId);
+        if (!prior.ok) { this.effect(applicationId, "availability", null, null, "failed", `couldn't read the current availability: ${prior.error}`); return; }
         const wrote = this.deps.availability.write(entityId, value);
         if (wrote.ok) this.effect(applicationId, "availability", { availability: prior.availability ?? null }, { availability: value }, "active", null);
         else this.effect(applicationId, "availability", { availability: prior.availability ?? null }, null, "failed", wrote.error);
-      }
+      });
     }
     if (mode.delivery.quiet) {
       const rule = mode.delivery.quiet;
-      const prior = this.quiet.show(entityId);
-      const source = `mode-application:${applicationId}`;
-      try {
-        const window = rule.kind === "daily"
-          ? this.quiet.setDaily(entityId, { start: rule.start, end: rule.end, timezone: rule.timezone, setBy: actor, now: at, source })
-          : this.quiet.setUntil(entityId, { until: scheduledEnd!, timezone: rule.timezone, setBy: actor, now: at, source });
-        this.effect(applicationId, "quiet", prior, { windowId: window.windowId, revision: window.revision, source }, "active", null);
-      } catch (error) {
-        this.effect(applicationId, "quiet", prior, null, "failed", (error as Error).message);
-      }
+      step("quiet", () => {
+        let prior: QuietWindow | null;
+        try { prior = this.quiet.show(entityId); }
+        catch (error) {
+          // Nothing is written when what's there now can't be read: there would be nothing honest to restore.
+          this.effect(applicationId, "quiet", null, null, "failed", `couldn't read the current quiet hours: ${(error as Error).message}`);
+          return;
+        }
+        const source = `mode-application:${applicationId}`;
+        try {
+          const window = rule.kind === "daily"
+            ? this.quiet.setDaily(entityId, { start: rule.start, end: rule.end, timezone: rule.timezone, setBy: actor, now: at, source })
+            : this.quiet.setUntil(entityId, { until: scheduledEnd!, timezone: rule.timezone, setBy: actor, now: at, source });
+          this.effect(applicationId, "quiet", prior, { windowId: window.windowId, revision: window.revision, source }, "active", null);
+        } catch (error) {
+          this.effect(applicationId, "quiet", prior, null, "failed", (error as Error).message);
+        }
+      });
     }
-    if (mode.decisionRoom) this.effect(applicationId, "decision-room", null, { applicationId }, "active", null);
+    if (mode.decisionRoom) step("decision-room", () => this.effect(applicationId, "decision-room", null, { applicationId }, "active", null));
     return { application: this.get(applicationId), ended };
   }
 
@@ -228,9 +241,14 @@ export class HumanModeService {
         this.effect(applicationId, effect.consumer, effect.prior, null, "ended", "it never took effect when the mode started, so there was nothing to undo");
         continue;
       }
-      if (effect.consumer === "decision-room") this.effect(applicationId, "decision-room", null, effect.changeIdentity, "ended", null);
-      else if (effect.consumer === "availability") this.endAvailability(entityId, applicationId, effect);
-      else this.endQuiet(entityId, applicationId, effect, actor, at);
+      // As when applying: a throw while ending one effect is that effect's failure, never the others'.
+      try {
+        if (effect.consumer === "decision-room") this.effect(applicationId, "decision-room", null, effect.changeIdentity, "ended", null);
+        else if (effect.consumer === "availability") this.endAvailability(entityId, applicationId, effect);
+        else this.endQuiet(entityId, applicationId, effect, actor, at);
+      } catch (error) {
+        this.effect(applicationId, effect.consumer, effect.prior, effect.changeIdentity, "failed", `couldn't end it: ${(error as Error).message}`);
+      }
     }
     return this.get(applicationId);
   }

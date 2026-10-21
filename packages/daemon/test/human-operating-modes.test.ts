@@ -1,7 +1,7 @@
 // Operating modes for a person: save a mode, apply it, end it. Through the real gateway routes with a temp home (the
 // human registry's fragments), a real SQLite schema and an injected clock; the service directly where a writer has to
 // fail. Ending a mode undoes only what is still its own: a later choice of the person's stays.
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Hono } from "hono";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -192,6 +192,24 @@ describe("effects that fail or can't be checked", () => {
     const ended = modes.end("alex", "back", "op")!;
     expect(stateOf(ended, "availability")).toBe("ended"); // it never took effect, so nothing to undo
     expect(stateOf(ended, "quiet")).toBe("ended");
+  });
+
+  it("QA F1: a quiet read that throws during apply fails only the quiet effect; the others are recorded, and ending works", async () => {
+    const f = fixture();
+    await f.call("PUT", "alex/modes/asleep", { ...asleep, quiet: "22:00-07:00" });
+    const show = vi.spyOn(HumanQuietStore.prototype, "show").mockImplementationOnce(() => { throw new Error("database is locked (test)"); });
+    let applied: Awaited<ReturnType<typeof f.call>>;
+    try { applied = await f.call("POST", "alex/modes/asleep/apply", {}); } finally { show.mockRestore(); }
+    expect(applied.status).toBe(200);
+    const app = applied.body.application;
+    expect(app.effects.map((e: Record<string, any>) => [e.consumer, e.state])).toEqual([["availability", "active"], ["decision-room", "active"], ["quiet", "failed"]]);
+    expect(app.effects.find((e: Record<string, any>) => e.consumer === "quiet")).toMatchObject({ changeIdentity: null, detail: expect.stringMatching(/^couldn't read the current quiet hours: database is locked/) });
+    expect(f.quiet.show("alex"), "nothing was written").toBeNull();
+    expect((await f.call("GET", "alex/mode")).body.current.effects).toEqual(app.effects);
+    const ended = (await f.call("POST", "alex/mode/end", {})).body.ended;
+    expect(ended.effects.map((e: Record<string, any>) => [e.consumer, e.state])).toEqual([["availability", "ended"], ["decision-room", "ended"], ["quiet", "ended"]]);
+    expect(ended.effects.find((e: Record<string, any>) => e.consumer === "quiet").detail).toMatch(/never took effect/);
+    expect(f.availability()).toBe("available");
   });
 
   it("a restore that fails is failed, not ended", async () => {
