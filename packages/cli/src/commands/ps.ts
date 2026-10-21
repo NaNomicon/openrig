@@ -651,6 +651,38 @@ function missingSessionGuidance(node: NodeEntry): string | null {
 // SCOPE, stated because the column invites a wider reading: this is the
 // SPEC-DECLARED model (nodes.model), NOT the model the seat is running. The
 // last observed native model is reported separately, with its provenance and time.
+/** One line per seat, except that a runtime's seats with no model reader share one line (#1680). It keeps every
+ *  configured model with its count; `--full` and `--json` still give each seat's own. */
+export function modelLines(nodes: NodeEntry[]): string[] {
+  const lines: string[] = [];
+  const unsupported = new Map<string, NodeEntry[]>();
+  const observed = new Map<NodeEntry, ModelObservation>();
+  for (const n of nodes) {
+    const observation = modelObservation(n.modelObservation, n.sessionStatus === "running");
+    observed.set(n, observation);
+    if (observation.status === "unknown" && observation.reason === "unsupported-runtime") {
+      const runtime = n.runtime ?? "unknown";
+      unsupported.set(runtime, [...(unsupported.get(runtime) ?? []), n]);
+    }
+  }
+  const summarized = new Set<string>();
+  for (const n of nodes) {
+    const runtime = n.runtime ?? "unknown";
+    const group = unsupported.get(runtime);
+    if (group && group.length > 1 && group.includes(n)) {
+      if (summarized.has(runtime)) continue;
+      summarized.add(runtime);
+      const configured = new Map<string, number>();
+      for (const seat of group) configured.set(formatDeclaredModel(seat.model), (configured.get(formatDeclaredModel(seat.model)) ?? 0) + 1);
+      lines.push(`Model (${group.length} ${runtime} seats): last observed UNKNOWN (unsupported-runtime: no model reader for ${runtime}); configured ${
+        [...configured].map(([model, count]) => count > 1 ? `${model} ×${count}` : model).join(", ")}`);
+      continue;
+    }
+    lines.push(`Model (${n.canonicalSessionName ?? n.logicalId}): configured ${formatDeclaredModel(n.model)}; last observed ${formatModelObservation(observed.get(n)!)}`);
+  }
+  return lines;
+}
+
 export function formatDeclaredModel(model: string | null | undefined): string {
   const m = (model ?? "").trim();
   return m.length > 0 ? m : "not-declared";
@@ -1302,9 +1334,7 @@ async function handleNodes(
       ));
     }
   }
-  for (const n of humanList as NodeEntry[]) {
-    console.log(`Model (${n.canonicalSessionName ?? n.logicalId}): configured ${formatDeclaredModel(n.model)}; last observed ${formatModelObservation(modelObservation(n.modelObservation, n.sessionStatus === "running"))}`);
-  }
+  for (const line of modelLines(humanList as NodeEntry[])) console.log(line);
   // Keep an actionable startup continuation outside the table's clipped cells.
   for (const n of humanList as NodeEntry[]) {
     if (n.startupStatus === "attention_required" && n.latestError?.includes("rig seat continue ")) {

@@ -92,7 +92,9 @@ time-bounded evidence. Rungs, top down, with each rung's retirement condition:
   window in production — never by fixture pass alone (symmetric admission: a fixture
   pass admits a rung to TRIAL, where it is measured but not consulted; production agreement
   promotes it). Undeclared and partial-coverage rungs are identity-only, which is also where
-  a degraded rung goes.
+  a degraded rung goes. For an omp seat or a community harness, sampling is positive-only:
+  a changing pane reads working, and a quiet one reads unknown, never idle, since the pane
+  can be quiet mid-turn.
 
 Partial-coverage honesty: a source with partial lifecycle coverage gets identity-only
 trust. The ladder is also the migration path — new oracles slot in above existing

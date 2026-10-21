@@ -106,7 +106,7 @@ export interface RungDeclaration {
  *  never inherits its predecessor's rung authority. */
 export interface AdapterRungInventory {
   adapterId: string;
-  runtime: "claude-code" | "codex" | "tmux-generic" | "community-harness";
+  runtime: "claude-code" | "codex" | "omp" | "tmux-generic" | "community-harness";
   rungs: RungDeclaration[];
 }
 
@@ -210,12 +210,21 @@ export const COMMUNITY_HARNESS_RUNG_INVENTORY: AdapterRungInventory = {
   rungs: [{ rung: "window-sampling", lifecycleCoverage: "partial", initialTrust: "positive-only" }],
 };
 
+/** omp (#1680): its runner's turn events don't staff a rung here, so a quiet pane can be mid-turn, waiting on the model or a
+ *  long tool call. Window sampling is positive-only, as for a community harness: a quiet screen reads unknown, never idle. */
+export const OMP_ACTIVITY_RUNG_INVENTORY: AdapterRungInventory = {
+  adapterId: "omp-runtime-adapter",
+  runtime: "omp",
+  rungs: [{ rung: "window-sampling", lifecycleCoverage: "partial", initialTrust: "positive-only" }],
+};
+
 /** Resolve a runtime string to its rung inventory (the ingest auto-declaration path).
  *  Unknown runtimes get the generic floor — partial-coverage honesty by default. A seat launched for a community
  *  community harness (its session's recorded selection, still the node's runtime) gets that app's inventory. */
 export function runtimeRungInventory(runtime: string | null, communityHarness?: string | null): AdapterRungInventory {
   if (runtime === "claude-code") return CLAUDE_ACTIVITY_RUNG_INVENTORY;
   if (runtime === "codex") return CODEX_ACTIVITY_RUNG_INVENTORY;
+  if (runtime === "omp") return OMP_ACTIVITY_RUNG_INVENTORY;
   if (communityHarnessOf(communityHarness, runtime)) return COMMUNITY_HARNESS_RUNG_INVENTORY;
   return TMUX_GENERIC_RUNG_INVENTORY;
 }

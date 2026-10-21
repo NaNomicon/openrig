@@ -10,6 +10,7 @@ import {
   COMMUNITY_HARNESS_RUNG_INVENTORY,
   CLAUDE_ACTIVITY_RUNG_INVENTORY,
   CODEX_ACTIVITY_RUNG_INVENTORY,
+  OMP_ACTIVITY_RUNG_INVENTORY,
   TMUX_GENERIC_RUNG_INVENTORY,
   runtimeRungInventory,
 } from "../src/domain/activity-taxonomy.js";
@@ -248,7 +249,8 @@ describe("activity for a community harness", () => {
   it("gives built-ins the inventories they had, and community harnesses their own", () => {
     expect(runtimeRungInventory("claude-code")).toBe(CLAUDE_ACTIVITY_RUNG_INVENTORY);
     expect(runtimeRungInventory("codex")).toBe(CODEX_ACTIVITY_RUNG_INVENTORY);
-    for (const runtime of ["pi", "omp", "terminal", "stub", null]) expect(runtimeRungInventory(runtime)).toBe(TMUX_GENERIC_RUNG_INVENTORY);
+    for (const runtime of ["pi", "terminal", "stub", null]) expect(runtimeRungInventory(runtime)).toBe(TMUX_GENERIC_RUNG_INVENTORY);
+    expect(runtimeRungInventory("omp")).toBe(OMP_ACTIVITY_RUNG_INVENTORY);
     // Only a seat launched for the app gets its inventory; a free-text runtime keeps the generic floor, as before.
     expect(runtimeRungInventory("synth", "synth")).toBe(COMMUNITY_HARNESS_RUNG_INVENTORY);
     expect(runtimeRungInventory("synth")).toBe(TMUX_GENERIC_RUNG_INVENTORY);
@@ -269,6 +271,16 @@ describe("activity for a community harness", () => {
     expect(s.state()).toMatchObject({ activity: "unknown", decidedBy: null });
     s.sample("idle-at-prompt");
     expect(s.state()).toMatchObject({ activity: "unknown", decidedBy: null, needsInputEvidence: null });
+    s.sample("working");
+    expect(s.state()).toMatchObject({ activity: "working", decidedBy: "window-sampling" });
+    s.sample("idle-at-prompt");
+    expect(s.state()).toMatchObject({ activity: "unknown", decidedBy: null });
+  });
+
+  it("reads a quiet omp screen as unknown, never idle, and a changing one as working (#1680)", () => {
+    const s = seat(runtimeRungInventory("omp"));
+    s.sample("idle-at-prompt");
+    expect(s.state()).toMatchObject({ activity: "unknown", decidedBy: null });
     s.sample("working");
     expect(s.state()).toMatchObject({ activity: "working", decidedBy: "window-sampling" });
     s.sample("idle-at-prompt");
