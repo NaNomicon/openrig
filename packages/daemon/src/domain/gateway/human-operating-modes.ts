@@ -327,8 +327,10 @@ export class HumanModeService {
   }
 
   private endAvailability(entityId: string, applicationId: string, effect: ModeEffect): void {
-    const identity = effect.changeIdentity as { availability: string; changeId?: string | null };
-    const wrote = identity.availability;
+    // The identity is what the mode itself last wrote: its own value when the mode started, or, after a restore that
+    // landed but didn't finish, the restored value with that restore's change id (so a retry finishes it).
+    const identity = effect.changeIdentity as { availability: string | null; changeId?: string | null };
+    const wrote = identity.availability ?? null;
     // A snapshot without `away` (only in data from before the flag was recorded, never merged) reads as false.
     const { availability: prior, away: priorAway = false } = effect.prior as { availability: string | null; away?: boolean };
     const now = this.deps.availability.read(entityId);
@@ -340,9 +342,10 @@ export class HumanModeService {
     // not) and the value is the one it wrote (so a hand edit of the file is not). A record from before change ids
     // existed falls back to the value alone.
     const sameChange = identity.changeId == null || now.changeId === identity.changeId;
-    if (now.availability !== wrote || !sameChange) {
+    const nowValue = now.availability ?? null; // an unset value reads undefined, and is recorded as null
+    if (nowValue !== wrote || !sameChange) {
       this.effect(applicationId, "availability", effect.prior, effect.changeIdentity, "kept",
-        `changed since the mode started (now ${now.availability ?? "not set"}${now.availability === wrote ? ", set again since" : ""}); that choice stands`);
+        `changed since the mode started (now ${now.availability ?? "not set"}${nowValue === wrote ? ", set again since" : ""}); that choice stands`);
       return;
     }
     // A legacy `away: true` added while the mode's away was on only agreed with it, and it would contradict a value being
@@ -358,8 +361,12 @@ export class HumanModeService {
       }
     }
     const restored = this.deps.availability.write(entityId, (prior ?? "unset") as Availability | "unset");
+    // Once the restore has landed (it succeeded, or failed after the fragment and record were written, so it carries its
+    // change id), the live state is the mode's own restore: a failure from here on records that restore's identity, so
+    // the retry recognises it and finishes, while a later manual change still reads as the person's. The prior stays.
+    const restoredIdentity = restored.changeId ? { availability: prior, changeId: restored.changeId } : null;
     if (!restored.ok) {
-      this.effect(applicationId, "availability", effect.prior, effect.changeIdentity, "failed", `couldn't restore ${prior ?? "not set"}: ${restored.error}`);
+      this.effect(applicationId, "availability", effect.prior, restoredIdentity ?? effect.changeIdentity, "failed", `couldn't restore ${prior ?? "not set"}: ${restored.error}`);
       return;
     }
     let detail = `restored to ${prior ?? "not set"}`;
@@ -368,7 +375,8 @@ export class HumanModeService {
       if (!now.away && setAway) {
         const back = setAway(entityId, true);
         if (!back.ok) {
-          this.effect(applicationId, "availability", effect.prior, effect.changeIdentity, "failed", `${detail}, but couldn't put away back on as it was before the mode: ${back.error}`);
+          this.effect(applicationId, "availability", effect.prior, restoredIdentity ?? effect.changeIdentity, "failed",
+            `${detail}, but couldn't put away back on as it was before the mode: ${back.error}`);
           return;
         }
       }
