@@ -1,0 +1,221 @@
+import { describe, expect, it } from "vitest";
+import fs from "node:fs";
+import net from "node:net";
+import os from "node:os";
+import nodePath from "node:path";
+import { OMP_BRIDGE_PROTOCOL_VERSION } from "../src/adapters/omp-bridge-protocol.js";
+import { OmpBridgeServer } from "../src/adapters/omp-bridge-server.js";
+import { OmpTuiBridge, type BridgeApi, type BridgeContext } from "../src/adapters/omp-tui-bridge.js";
+
+/** A short socket path inside a fresh temp dir (Unix sockets cap at 108 chars). */
+function tempSocketPath(name: string): string {
+  const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "openrig-omp-tui-"));
+  return nodePath.join(dir, `${name}.sock`);
+}
+
+/** Collects frames and lets a test wait for the next one it cares about. */
+class FrameCollector {
+  readonly frames: Record<string, unknown>[] = [];
+  private readonly waiters: Array<{
+    match: (frame: Record<string, unknown>) => boolean;
+    resolve: (frame: Record<string, unknown>) => void;
+  }> = [];
+
+  add(frame: Record<string, unknown>): void {
+    this.frames.push(frame);
+    for (const waiter of [...this.waiters]) {
+      if (!waiter.match(frame)) continue;
+      this.waiters.splice(this.waiters.indexOf(waiter), 1);
+      waiter.resolve(frame);
+    }
+  }
+
+  waitFor(match: (frame: Record<string, unknown>) => boolean): Promise<Record<string, unknown>> {
+    const existing = this.frames.find(match);
+    if (existing) return Promise.resolve(existing);
+    return new Promise((resolve) => { this.waiters.push({ match, resolve }); });
+  }
+}
+
+/** The OMP-side fake: an extension API that records what OMP was asked to do. */
+function fakeExtensionApi() {
+  const handlers = new Map<string, (event: Record<string, unknown>, ctx: BridgeContext) => void>();
+  const messages: Array<{ content: string; deliverAs?: string }> = [];
+  let notify: (() => void) | null = null;
+  const api: BridgeApi = {
+    on: (event, handler) => { handlers.set(event, handler); },
+    sendUserMessage: (content, options) => {
+      messages.push({ content, deliverAs: options?.deliverAs });
+      notify?.();
+    },
+  };
+  /** Resolves once OMP was asked to deliver at least `count` messages. */
+  const waitForMessages = (count: number): Promise<void> => new Promise((resolve) => {
+    const check = (): void => {
+      if (messages.length >= count) {
+        resolve();
+        return;
+      }
+      notify = () => { check(); };
+    };
+    check();
+  });
+  return { api, handlers, messages, waitForMessages };
+}
+
+describe("the OMP bridge reports events and applies commands", () => {
+  it("hands the runner OMP's events, the session identity, and one reply per request", async () => {
+    const socketPath = tempSocketPath("events");
+    const bridgeFrames = new FrameCollector();
+    const controlFrames = new FrameCollector();
+    let aborted = false;
+    const ctx: BridgeContext = {
+      sessionManager: {
+        getSessionId: () => "session-1",
+        getSessionFile: () => "/state/omp/seat/sessions/2026_1.jsonl",
+        getEntries: () => [{ id: "entry-1" }, { id: "entry-2" }],
+      },
+      abort: () => { aborted = true; },
+    };
+
+    let readyBridge: (handshake: Record<string, unknown>) => void = () => { /* replaced below */ };
+    const bridgeReady = new Promise<Record<string, unknown>>((resolve) => { readyBridge = resolve; });
+    const server = new OmpBridgeServer({
+      socketPath,
+      onBridgeFrame: (frame) => { bridgeFrames.add(frame); },
+      onControlFrame: (frame) => { controlFrames.add(frame); },
+      onBridgeReady: (handshake) => { readyBridge(handshake as Record<string, unknown>); },
+    });
+    await server.start();
+
+    const { api, handlers, messages, waitForMessages } = fakeExtensionApi();
+    const bridge = new OmpTuiBridge(api, socketPath);
+    await bridge.start();
+
+    // The handshake identifies the bridge and carries the protocol version.
+    expect(await bridgeReady).toMatchObject({
+      role: "bridge",
+      protocolVersion: OMP_BRIDGE_PROTOCOL_VERSION,
+    });
+
+    // An OMP event reaches the runner as a frame of the same type.
+    handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+    expect(await bridgeFrames.waitFor((frame) => frame.type === "agent_start")).toMatchObject({ type: "agent_start" });
+
+    // The identity the runner needs for its sidecar and resume token.
+    expect(await bridgeFrames.waitFor((frame) => frame.type === "session_identity")).toMatchObject({
+      type: "session_identity",
+      sessionId: "session-1",
+      sessionFile: "/state/omp/seat/sessions/2026_1.jsonl",
+    });
+
+    // A Rig message becomes OMP's own user message; steer and follow-up keep
+    // their delivery modes, and abort cancels the running turn.
+    server.sendToBridge({ type: "prompt", message: "hello" });
+    server.sendToBridge({ type: "steer", message: "turn left" });
+    server.sendToBridge({ type: "follow_up", message: "then this" });
+    server.sendToBridge({ type: "abort" });
+    await waitForMessages(3);
+    expect(messages).toEqual([
+      { content: "hello", deliverAs: undefined },
+      { content: "turn left", deliverAs: "steer" },
+      { content: "then this", deliverAs: "followUp" },
+    ]);
+    expect(aborted).toBe(true);
+
+    // A state request is answered in the RPC response shape.
+    server.sendToBridge({ type: "get_state", id: "state-1" });
+    expect(await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "state-1")).toMatchObject({
+      type: "response",
+      id: "state-1",
+      success: true,
+      data: { sessionId: "session-1", sessionFile: "/state/omp/seat/sessions/2026_1.jsonl" },
+    });
+
+    // Entry ids let the runner advance its durable cursor.
+    server.sendToBridge({ type: "get_entries", id: "entries-1" });
+    expect(await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "entries-1")).toMatchObject({
+      data: { entries: [{ id: "entry-1" }, { id: "entry-2" }] },
+    });
+
+    expect(controlFrames.frames).toHaveLength(0);
+    bridge.close();
+    server.close();
+  });
+
+  it("reports one frame for an event the same source repeats", async () => {
+    const socketPath = tempSocketPath("dedupe");
+    const bridgeFrames = new FrameCollector();
+    const server = new OmpBridgeServer({
+      socketPath,
+      onBridgeFrame: (frame) => { bridgeFrames.add(frame); },
+      onControlFrame: () => { /* no control client in this case */ },
+    });
+    await server.start();
+    const { api, handlers } = fakeExtensionApi();
+    const bridge = new OmpTuiBridge(api, socketPath);
+    await bridge.start();
+    const ctx: BridgeContext = {
+      sessionManager: { getSessionId: () => "s", getSessionFile: () => "/f.jsonl" },
+    };
+
+    const event = { type: "tool_execution_start", toolCallId: "call-1", toolName: "bash" };
+    handlers.get("tool_execution_start")?.(event, ctx);
+    handlers.get("tool_execution_start")?.(event, ctx);
+    await bridgeFrames.waitFor((frame) => frame.type === "tool_execution_start");
+    expect(bridgeFrames.frames.filter((frame) => frame.type === "tool_execution_start")).toHaveLength(1);
+
+    bridge.close();
+    server.close();
+  });
+});
+
+describe("the bridge socket routes both roles", () => {
+  it("relays a control client's command to the bridge and queues commands sent too early", async () => {
+    const socketPath = tempSocketPath("roles");
+    const controlFrames = new FrameCollector();
+    const bridgeFrames = new FrameCollector();
+    const server = new OmpBridgeServer({
+      socketPath,
+      onBridgeFrame: (frame) => { bridgeFrames.add(frame); },
+      onControlFrame: (frame) => { controlFrames.add(frame); },
+    });
+    await server.start();
+
+    // A command sent before the bridge connects waits for it.
+    server.sendToBridge({ type: "prompt", message: "queued" });
+    expect(server.pendingCount).toBe(1);
+
+    // The bridge connects, identifies itself, and receives the queued command.
+    const bridgeSocket = net.connect({ path: socketPath });
+    const queued = await new Promise<Record<string, unknown>>((resolve) => {
+      let buffer = "";
+      bridgeSocket.on("data", (chunk: Buffer) => {
+        buffer += chunk.toString("utf8");
+        for (const line of buffer.split("\n")) {
+          if (!line.trim()) continue;
+          const frame = JSON.parse(line) as Record<string, unknown>;
+          if (frame.type === "prompt") resolve(frame);
+        }
+      });
+      bridgeSocket.write(`${JSON.stringify({ role: "bridge", protocolVersion: OMP_BRIDGE_PROTOCOL_VERSION })}\n`);
+    });
+    expect(queued).toEqual({ type: "prompt", message: "queued" });
+    expect(server.pendingCount).toBe(0);
+
+    // A control client identifies itself, then sends a command.
+    const controlSocket = net.connect({ path: socketPath });
+    controlSocket.write(`${JSON.stringify({ role: "control", protocolVersion: OMP_BRIDGE_PROTOCOL_VERSION })}\n`);
+    controlSocket.write(`${JSON.stringify({ type: "prompt", message: "from the daemon" })}\n`);
+    expect(await controlFrames.waitFor((frame) => frame.type === "prompt")).toEqual({ type: "prompt", message: "from the daemon" });
+
+    // The bridge's own frames stay on the bridge channel.
+    bridgeSocket.write(`${JSON.stringify({ type: "agent_start" })}\n`);
+    await bridgeFrames.waitFor((frame) => frame.type === "agent_start");
+    expect(controlFrames.frames.filter((frame) => frame.type === "agent_start")).toHaveLength(0);
+
+    bridgeSocket.destroy();
+    controlSocket.destroy();
+    server.close();
+  });
+});
