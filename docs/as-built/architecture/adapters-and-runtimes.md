@@ -90,15 +90,16 @@ ends `attention_required`.
 
 ## 2. The runtime adapters
 
-**5** classes implement `RuntimeAdapter`
+**6** classes implement `RuntimeAdapter`
 (`git grep -l 'implements RuntimeAdapter' packages/daemon/src | wc -l`):
-`ClaudeCodeAdapter`, `CodexRuntimeAdapter`, `PiRuntimeAdapter`,
-`StubRuntimeAdapter` and `TerminalAdapter`. All live under
+`ClaudeCodeAdapter`, `CodexRuntimeAdapter`, `CommunityHarnessRuntimeAdapter`,
+`PiRuntimeAdapter`, `StubRuntimeAdapter` and `TerminalAdapter`. All live under
 `packages/daemon/src/adapters/` (Architecture Rule 1: **0** files there import
 Hono, `git grep -l 'from "hono' -- packages/daemon/src/adapters | wc -l`).
-`OmpRuntimeAdapter` (Oh My Pi) extends `PiRuntimeAdapter`, so the daemon wires
-**6** runtime keys — `claude-code`, `codex`, `pi`, `omp`, `stub`, `terminal`
-(`startup.ts:989`, and the same map at `:1259`;
+`OmpRuntimeAdapter` (Oh My Pi) and `OmpTuiRuntimeAdapter` (Oh My Pi with its
+own native TUI) extend `PiRuntimeAdapter`, so the daemon wires **7** runtime
+keys — `claude-code`, `codex`, `pi`, `omp`, `omp-tui`, `stub`, `terminal`
+(`startup.ts:1067`, and the same map at `:1122`;
 `grep 'adapters: {' packages/daemon/src/startup.ts | grep -o -E '"[a-z-]+": ' | wc -l`).
 
 ### Launch posture
@@ -291,6 +292,9 @@ resume launches (`codex-runtime-adapter.ts:378`, `codex-resume.ts:103`).
 - `PiRuntimeAdapter` (`pi-runtime-adapter.ts:64`), `runtime` `"pi"` (`:65`).
 - `OmpRuntimeAdapter` (`omp-runtime-adapter.ts:7`) extends it with
   `runtime = "omp"` (`:8`).
+- `OmpTuiRuntimeAdapter` (`omp-tui-runtime-adapter.ts:16`) extends it with
+  `runtime = "omp-tui"` (`:17`), the same OMP process with OMP's own
+  interactive TUI in the seat pane.
 - `StubRuntimeAdapter` (`stub-runtime-adapter.ts:69`), `runtime` defaulting to
   `"stub"` (`:81`).
 
@@ -298,6 +302,37 @@ Pi and stub launch an OpenRig runner inside the seat's tmux pane (header
 comments `pi-runtime-adapter.ts:1–10`, `stub-runtime-adapter.ts:1–14`). Pi
 and Oh My Pi support fork and report `pi_session_file` or `omp_session_file`
 resume tokens; the stub refuses fork and reports `stub_session`.
+
+### The `omp-tui` shape: OMP's own TUI in the seat pane
+
+`runtime: omp-tui` keeps the RPC integration and changes who owns the pane.
+The runner launches interactive OMP under a pty (`script -qfec`, util-linux)
+and hands the pane's terminal to it, so the pane shows OMP's native TUI
+instead of a mirrored transcript. The runner itself writes only to
+`<seatRoot>/runner.log`; the pane belongs to the TUI.
+
+Because the TUI cannot be scraped or typed into, an OpenRig-shipped extension
+(`omp-tui-bridge.ts`, loaded by OMP through `--trusted-extension`) runs inside
+the OMP process and talks to the runner over a Unix socket
+(`<seatRoot>/omp-bridge.sock`):
+
+- **bridge role** (the extension): reports OMP's session events and the
+  session identity; applies the commands the runner relays (a Rig message, a
+  steer, a follow-up, an abort, a state read).
+- **control role** (the daemon): sends one command frame per Rig message.
+
+The frames reuse the RPC vocabulary (`{type:"response", id, success, data}`
+replies, unchanged OMP event names), so the runner feeds them into the same
+event path the RPC child used: activity, session identity and the readiness
+sidecar keep working unchanged. A Rig message therefore reaches OMP's own
+conversation instead of being typed into the pane
+(`SessionTransport.sendUnguarded` calls the adapter's `deliverMessage`).
+
+The native TUI is the only approval authority: the runner neither cancels
+`extension_ui_request` nor raises a permission prompt, and readiness waits
+for the bridge's identity frame instead of a `get_state` reply. Resume tokens
+stay the OMP session file, reported as `omp-tui_session_file`.
+
 
 `createDaemon` constructs the adapters (`startup.ts:778`, `:779`, `:782`,
 `:783`, `:788`) and creates the terminal adapter inline in the runtime adapter
@@ -425,6 +460,6 @@ module.
   snapshot/restore (resume vs rebuild vs fresh).
 - `architecture-rules-and-event-system.md` — the full architecture rule list.
 - Source roots: `packages/daemon/src/domain/runtime-adapter.ts`,
-  `packages/daemon/src/adapters/{claude-code-adapter,codex-runtime-adapter,pi-runtime-adapter,omp-runtime-adapter,stub-runtime-adapter,terminal-adapter,yolo-mode,non-interruptive,kernel-authority}.ts`,
+  `packages/daemon/src/adapters/{claude-code-adapter,codex-runtime-adapter,pi-runtime-adapter,omp-runtime-adapter,omp-tui-runtime-adapter,omp-tui-bridge,omp-bridge-protocol,omp-bridge-server,stub-runtime-adapter,terminal-adapter,yolo-mode,non-interruptive,kernel-authority}.ts`,
   `packages/daemon/src/domain/{native-resume-probe,resume-metadata-refresher,codex-thread-id,claude-managed-launch,codex-network-default,native-permission-store}.ts`,
   `packages/daemon/src/domain/permission-policy/policy-ref.ts`.
