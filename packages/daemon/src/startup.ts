@@ -287,9 +287,9 @@ const OMP_PROVIDER_AUTH_ENV: Record<string, true> = Object.fromEntries(
 export function collectAllowlistedProviderAuthEnv(
   raw: string | null | undefined,
   env: Record<string, string | undefined>,
-  runtime?: "omp",
+  runtime?: "omp" | "omp-tui",
 ): Record<string, string> {
-  const admitOmp = runtime === "omp";
+  const admitOmp = runtime === "omp" || runtime === "omp-tui";
   const out: Record<string, string> = {};
   for (const item of (raw ?? "").split(",")) {
     const name = item.trim();
@@ -598,6 +598,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // successors); every other runtime's seat env is unchanged.
   const runtimeSessionEnv: Record<string, Record<string, string | undefined>> = {
     omp: collectAllowlistedProviderAuthEnv(startupSettings.recoveryProviderAuthEnvAllowlistRaw, process.env, "omp"),
+    "omp-tui": collectAllowlistedProviderAuthEnv(startupSettings.recoveryProviderAuthEnvAllowlistRaw, process.env, "omp-tui"),
   };
   const transcriptStore = new TranscriptStore({
     enabled: transcriptsEnabled,

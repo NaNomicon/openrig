@@ -309,7 +309,12 @@ resume tokens; the stub refuses fork and reports `stub_session`.
 The runner launches interactive OMP under a pty (`script -qfec`, util-linux)
 and hands the pane's terminal to it, so the pane shows OMP's native TUI
 instead of a mirrored transcript. The runner itself writes only to
-`<seatRoot>/runner.log`; the pane belongs to the TUI.
+`<seatRoot>/runner.log`; the pane belongs to the TUI. The native spawn uses
+`stdio: ["inherit", "inherit", "pipe"]` so `script` reads the pane's tty
+directly; a piped stdin leaves the child pty at size `0 0` with no
+`SIGWINCH`, so the TUI could neither size itself nor reflow on resize
+(measured: `stty size` reports `0 0` through a pipe, `30 100` on the
+inherited tty).
 
 Because the TUI cannot be scraped or typed into, an OpenRig-shipped extension
 (`omp-tui-bridge.ts`, loaded by OMP through `--trusted-extension`) runs inside
@@ -333,6 +338,13 @@ The native TUI is the only approval authority: the runner neither cancels
 for the bridge's identity frame instead of a `get_state` reply. Resume tokens
 stay the OMP session file, reported as `omp-tui_session_file`.
 
+The runner announces the session identity with the child runtime
+(`runtime: "omp"`), so the activity route accepts an `omp` emitter for an
+`omp-tui` seat and persists the token under the seat's runtime
+(`omp-tui_session_file`, provenance `bridge` in the
+`agent.session_identity` event). An `omp-tui` emitter for a plain `omp`
+seat is refused with `runtime_mismatch` — the seats stay exclusive.
+
 Manual check (one seat in a tmux pane, after `npm run build -w packages/daemon`):
 
 ```bash
@@ -348,6 +360,25 @@ then "READY session=…", and the sidecar `runner-state.json` gets
 `ready: true` with the OMP session file. A Rig message then arrives through
 the control role of that same socket and OMP answers in the same
 conversation; the pane is never typed into.
+
+Rig-level check (a scratch `OPENRIG_HOME` + daemon on a spare port, so the
+operator's rig is untouched): start the daemon with `OPENRIG_URL` and
+`OPENRIG_PORT` pointing at itself (the seat's activity URL is derived from
+the daemon's own env), a rig spec with `runtime: omp-tui`, then
+`rig up --fresh`. Observed: the pane shows OMP's TUI with approval prompts
+and Enter approves the focused choice; `rig send <seat> "Reply with exactly:
+RIG_ROUNDTRIP_OK"` lands in the session JSONL as a user message carrying the
+OpenRig envelope (`From: <sessionName>`) and the agent replies in the same
+conversation; resizing the pane reflows the TUI; `rig down` +
+`rig up --existing` resumes the same session file (`sessions.resume_type =
+"omp-tui_session_file"`, result "fully_restored" / "resumed").
+
+Seat prerequisites: OMP reads its config from the seat's
+`PI_CODING_AGENT_DIR` (`<stateRoot>/<sessionName>/agent`) — copy
+`config.yml` and `models.yml` there. Provider credentials reach the seat
+only through the allowlisted provider env map or the seat's own `.env`: a
+custom provider not listed in `OMP_PROVIDER_ENV_VARS` must put its key in
+the seat's `.env` (mode 600).
 
 
 `createDaemon` constructs the adapters (`startup.ts:778`, `:779`, `:782`,

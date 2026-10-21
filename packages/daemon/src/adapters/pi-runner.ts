@@ -1369,18 +1369,23 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     spawnCommand = launcher;
     spawnArgs = ["-qfec", shellCommandLine([command, ...childArgs]), "/dev/null"];
   }
+  // Native mode hands `script` the pane's own terminal: the pty then inherits
+  // the pane's termios and window size, and script forwards SIGWINCH, so
+  // OMP's TUI renders at the pane's width and reflows when the pane is
+  // resized. A piped stdin leaves the child's terminal at 0x0, which breaks
+  // both. Mirror mode keeps the pipes: there the runner owns the child's
+  // input and output.
+  const stdio: ["inherit" | "pipe", "inherit" | "pipe", "pipe"] = nativeTui
+    ? ["inherit", "inherit", "pipe"]
+    : ["pipe", "pipe", "pipe"];
   const child = spawn(spawnCommand, spawnArgs, {
     cwd: args.cwd,
     env: childEnv,
-    stdio: ["pipe", "pipe", "pipe"],
+    stdio,
   });
-  if (nativeTui) {
-    // The pane's keys reach OMP's TUI; the TUI's screen reaches the pane.
-    process.stdin.pipe(child.stdin);
-  }
 
   // The child may close its pipe before the first RPC write completes.
-  child.stdin.on("error", () => { /* spawn/exit handlers own the diagnosis */ });
+  child.stdin?.on("error", () => { /* spawn/exit handlers own the diagnosis */ });
 
   const chargeLookup = new OpenRouterChargeLookup({
     fetchGeneration: openRouterGenerationFetcher(() => childEnv["OPENROUTER_API_KEY"]),
@@ -1410,7 +1415,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
         bridge?.sendToBridge(cmd);
         return;
       }
-      try { child.stdin.write(`${JSON.stringify(cmd)}\n`); } catch { /* exit handler reports */ }
+      try { child.stdin?.write(`${JSON.stringify(cmd)}\n`); } catch { /* exit handler reports */ }
     },
     mirrorLine: (line) => report(line),
     mirrorAppend: (text) => report(text.replace(/\n$/, "")),
@@ -1486,11 +1491,12 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   coreRef = core;
 
   let transportUp = runtime === "pi";
-  if (nativeTui) {
-    // OMP's own TUI owns the pane: its screen output goes straight through.
-    child.stdout.pipe(process.stdout);
-  } else {
-    readline.createInterface({ input: child.stdout }).on("line", (line) => {
+  if (!nativeTui) {
+    // Mirror mode: the runner reads the child's output line by line. Native
+    // mode writes OMP's TUI screen straight to the pane, so the runner never
+    // reads or parses it.
+    const childLines = child.stdout ? readline.createInterface({ input: child.stdout }) : undefined;
+    childLines?.on("line", (line) => {
       if (runtime === "omp" && !core.isReady()) {
         try {
           const frame = JSON.parse(line) as { type?: string };
@@ -1510,7 +1516,8 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   // reported with its own words in the error, not only above it.
   const stderrTail: string[] = [];
   let reportedPiCapability = false;
-  readline.createInterface({ input: child.stderr }).on("line", (line) => {
+  const stderrLines = child.stderr ? readline.createInterface({ input: child.stderr }) : undefined;
+  stderrLines?.on("line", (line) => {
     if (!line.trim()) return;
     report(`[${runtime}:err] ${line}`);
     stderrTail.push(line.length > OMP_STDERR_TAIL_CHARS ? `${line.slice(0, OMP_STDERR_TAIL_CHARS)}...` : line);
