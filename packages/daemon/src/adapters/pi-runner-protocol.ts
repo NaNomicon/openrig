@@ -15,6 +15,10 @@
 // - The runner persists `runner-state.json` (the sidecar) from RPC
 //   `get_state`, and prints the READY marker to the pane; the daemon reads
 //   ONLY runner-authored surfaces — never Pi TUI heuristics (BR-1).
+// - The `omp-tui` runtime key selects a SEPARATE contract (BR-2): `--ui native`
+//   spawns the agent's OWN interactive TUI under a pty and an agent-side bridge
+//   extension relays typed events over a Unix socket. The `pi`/`omp` keys keep
+//   RPC mode, and their commands stay byte-for-byte unchanged.
 
 import nodePath from "node:path";
 import { shellQuote } from "./shell-quote.js";

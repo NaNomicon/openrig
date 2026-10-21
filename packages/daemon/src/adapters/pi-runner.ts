@@ -15,6 +15,19 @@
 // a dead pi process prints the EXIT/ERROR marker and records `exited` in the
 // sidecar — never a silently frozen pane.
 //
+// Two UI contracts share this runner:
+//   mirror (default)     — the runner mirrors the agent's RPC events to pane
+//                          stdout and forwards pane stdin to
+//                          prompt/steer/follow_up.
+//   native (--ui native) — the runner spawns the agent's OWN interactive TUI
+//                          under a pty: the pane shows that TUI, never a
+//                          mirror, and pane stdin/stdout ARE the pty's. Typed
+//                          events arrive over the OMP bridge socket instead of
+//                          stdout (`--trusted-extension` +
+//                          OPENRIG_OMP_BRIDGE_SOCKET), and Rig messages are
+//                          proxied back in through that socket's control role
+//                          — the pane is never typed into.
+//
 // Only node builtins and local runner helpers are imported so the compiled
 // entry stays runnable as `node <dist>/adapters/pi-runner.js` with no daemon deps.
 

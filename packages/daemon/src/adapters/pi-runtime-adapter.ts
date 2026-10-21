@@ -7,7 +7,10 @@
 // mirrors a legible transcript to pane stdout); activity + session identity
 // come from Pi's typed RPC events + get_state via the runner's sidecar and
 // bus emission — never pane scraping (BR-1). TUI-native Pi is a SEPARATE
-// future contract, never a hidden mode here (BR-2).
+// contract (BR-2): its own runtime key (`omp-tui`) and its own adapter class
+// (OmpTuiRuntimeAdapter). The `pi`/`omp` runtime keys stay RPC-only — the
+// `childRuntime`/`uiMode` seams below exist so that separate contract can
+// reuse this class's plumbing, never to make this adapter a hidden mode.
 
 import nodePath from "node:path";
 import { randomUUID } from "node:crypto";
