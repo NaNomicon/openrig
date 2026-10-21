@@ -10,7 +10,8 @@ import type { Migration } from "../migrate.js";
 // - human_mode_applications: one per application; at most one active (ended_at NULL) per person. `settings` is the
 //   mode as it was applied, so later edits to the saved mode don't rewrite history.
 // - human_mode_effects: what an application changed, per consumer: the prior value, the identity of the change it
-//   wrote (what ending checks is still its own), and the effect's real state.
+//   wrote (what ending checks is still its own), and the effect's real state. `handed-off`: a later mode took over
+//   restoring this one's prior value (its own restore was still owed when that mode was applied).
 // The legacy operator-context mode bindings (operator_context_mode_bindings) are separate and untouched.
 export const humanOperatingModesSchema: Migration = {
   name: "122_human_operating_modes.sql",
@@ -46,7 +47,7 @@ export const humanOperatingModesSchema: Migration = {
       consumer        TEXT NOT NULL CHECK (consumer IN ('availability', 'quiet', 'decision-room')),
       prior           TEXT,
       change_identity TEXT,
-      state           TEXT NOT NULL CHECK (state IN ('active', 'pending', 'failed', 'ended', 'kept')),
+      state           TEXT NOT NULL CHECK (state IN ('active', 'pending', 'failed', 'ended', 'kept', 'handed-off')),
       detail          TEXT,
       updated_at      TEXT NOT NULL,
       PRIMARY KEY (application_id, consumer)

@@ -35,7 +35,8 @@ export interface SavedMode {
 }
 
 export type EffectConsumer = "availability" | "quiet" | "decision-room";
-export type EffectState = "active" | "pending" | "failed" | "ended" | "kept";
+/** `handed-off`: a later mode applied while this effect's restore was still owed took over restoring its prior value. */
+export type EffectState = "active" | "pending" | "failed" | "ended" | "kept" | "handed-off";
 
 export interface ModeEffect {
   consumer: EffectConsumer;
@@ -191,15 +192,21 @@ export class HumanModeService {
       step("availability", () => {
         const prior = this.deps.availability.read(entityId);
         if (!prior.ok) { this.effect(applicationId, "availability", null, null, "failed", `couldn't read the current availability: ${prior.error}`); return; }
+        // An earlier mode whose restore is still owed, and whose change is still the live one: its prior is the real one.
+        const owed = this.owedStillOwn(entityId, "availability", (identity) => {
+          const id = identity as { availability: string; changeId?: string | null };
+          return prior.availability === id.availability && (id.changeId == null || prior.changeId === id.changeId);
+        });
         const wrote = this.deps.availability.write(entityId, value);
         // The change identity is the change record the write left (read back right after it) and the value. A write can
         // also fail after the fragment is saved (re-projecting it fails); the value is then live on the next load, so if
         // it's now the mode's, the change is still recorded as the mode's own and ending puts the prior value back.
         const after = this.deps.availability.read(entityId);
         const landed = after.ok && after.availability === value ? { availability: value, changeId: after.changeId ?? null } : null;
-        const priorValue = { availability: prior.availability ?? null };
+        const priorValue = (owed?.effect.prior as { availability: string | null } | undefined) ?? { availability: prior.availability ?? null };
         if (wrote.ok && landed) this.effect(applicationId, "availability", priorValue, landed, "active", null);
         else this.effect(applicationId, "availability", priorValue, landed, "failed", wrote.ok ? "written, but it didn't read back as written" : wrote.error);
+        if (owed && landed) this.handOff(owed, applicationId, mode.name, `availability ${priorValue.availability ?? "not set"}`);
       });
     }
     if (mode.delivery.quiet) {
@@ -212,12 +219,18 @@ export class HumanModeService {
           this.effect(applicationId, "quiet", null, null, "failed", `couldn't read the current quiet hours: ${(error as Error).message}`);
           return;
         }
+        const owed = this.owedStillOwn(entityId, "quiet", (identity) => {
+          const id = identity as { revision: number; source: string };
+          return !!prior && prior.revision === id.revision && prior.source === id.source;
+        });
+        if (owed) prior = owed.effect.prior as QuietWindow | null;
         const source = `mode-application:${applicationId}`;
         try {
           const window = rule.kind === "daily"
             ? this.quiet.setDaily(entityId, { start: rule.start, end: rule.end, timezone: rule.timezone, setBy: actor, now: at, source })
             : this.quiet.setUntil(entityId, { until: scheduledEnd!, timezone: rule.timezone, setBy: actor, now: at, source });
           this.effect(applicationId, "quiet", prior, { windowId: window.windowId, revision: window.revision, source }, "active", null);
+          if (owed) this.handOff(owed, applicationId, mode.name, describeQuiet(prior));
         } catch (error) {
           this.effect(applicationId, "quiet", prior, null, "failed", (error as Error).message);
         }
@@ -269,7 +282,7 @@ export class HumanModeService {
 
   private endEffects(entityId: string, applicationId: string, actor: string, at: Date): void {
     for (const effect of this.effects(applicationId)) {
-      if (effect.state === "ended" || effect.state === "kept") continue;
+      if (effect.state === "ended" || effect.state === "kept" || effect.state === "handed-off") continue;
       if (effect.state === "failed" && effect.changeIdentity === null) {
         this.effect(applicationId, effect.consumer, effect.prior, null, "ended", "it never took effect when the mode started, so there was nothing to undo");
         continue;
@@ -283,6 +296,19 @@ export class HumanModeService {
         this.effect(applicationId, effect.consumer, effect.prior, effect.changeIdentity, "failed", `couldn't end it: ${(error as Error).message}`);
       }
     }
+  }
+
+  /** The latest earlier application's still-owed restore of this consumer, if its change is still the live one. */
+  private owedStillOwn(entityId: string, consumer: EffectConsumer, stillOwn: (identity: unknown) => boolean) {
+    const owed = this.unresolved(entityId).filter((u) => u.effect.consumer === consumer).at(-1);
+    return owed && owed.effect.changeIdentity !== null && stillOwn(owed.effect.changeIdentity) ? owed : null;
+  }
+
+  /** Close an earlier effect whose restore a later mode took over: not kept (nobody chose otherwise), not ended (nothing
+   *  was restored yet), but handed to the mode that now restores its prior value. */
+  private handOff(owed: { applicationId: string; effect: ModeEffect }, toApplicationId: string, toMode: string, prior: string): void {
+    this.effect(owed.applicationId, owed.effect.consumer, owed.effect.prior, owed.effect.changeIdentity, "handed-off",
+      `handed to ${toMode} (${toApplicationId}), which restores ${prior} when it ends`);
   }
 
   private endAvailability(entityId: string, applicationId: string, effect: ModeEffect): void {
@@ -394,4 +420,9 @@ function toSaved(row: SavedRow): SavedMode {
     delivery: { quiet: row.quiet_rule ? JSON.parse(row.quiet_rule) as QuietRule : null, account: row.account_destination },
     setBy: row.set_by, setAt: row.set_at,
   };
+}
+
+function describeQuiet(window: QuietWindow | null): string {
+  if (!window) return "no quiet hours";
+  return window.kind === "daily" ? `the daily quiet hours ${window.start}-${window.end} ${window.timezone}` : `quiet hours until ${window.until}`;
 }

@@ -296,6 +296,43 @@ describe("effects that fail or can't be checked", () => {
     expect(f.availability()).toBe("available");
   });
 
+  it("review F3 switch: an availability restore still owed at a switch is handed to the new mode, which restores the original value", async () => {
+    const f = fixture(); // alex: available
+    const real = registryAvailability(f.home);
+    let failReads = 0;
+    const modes = service(f, { read: (id) => (failReads-- > 0 ? { ok: false, error: "registry unreadable (test)" } : real.read(id)), write: real.write });
+    modes.save("alex", { name: "asleep", availability: { value: "off" } }, "op");
+    modes.save("alex", { name: "away-from-desk", availability: { value: "away" } }, "op");
+    const asleep = modes.apply("alex", "asleep", {}, "op").application!;
+    failReads = 1; // the switch's end can't read the registry once: asleep's restore is owed
+    const away = modes.apply("alex", "away-from-desk", {}, "op").application!;
+    expect(away.effects[0]).toMatchObject({ consumer: "availability", state: "active", prior: { availability: "available" } });
+    expect(modes.get(asleep.applicationId)!.effects[0]).toMatchObject({ state: "handed-off",
+      detail: `handed to away-from-desk (${away.applicationId}), which restores availability available when it ends` });
+    expect(modes.unresolved("alex")).toEqual([]);
+    modes.end("alex", "back", "op");
+    expect(f.availability()).toBe("available"); // the original value, not asleep's off
+    expect(stateOf(modes.get(away.applicationId)!, "availability")).toBe("ended");
+    expect(stateOf(modes.get(asleep.applicationId)!, "availability")).toBe("handed-off");
+  });
+
+  it("review F3 switch: a quiet restore that failed at a switch is handed to the new mode, so asleep's nightly rule doesn't come back", async () => {
+    const f = fixture(); // no quiet hours before
+    const modes = service(f, registryAvailability(f.home));
+    modes.save("alex", { name: "asleep", delivery: { quiet: { kind: "daily", start: "22:00", end: "07:00", timezone: "UTC" }, account: null } }, "op");
+    modes.save("alex", { name: "away-from-desk", delivery: { quiet: { kind: "daily", start: "23:00", end: "05:00", timezone: "UTC" }, account: null } }, "op");
+    const asleep = modes.apply("alex", "asleep", {}, "op").application!;
+    const clear = vi.spyOn(HumanQuietStore.prototype, "clear").mockImplementationOnce(() => { throw new Error("database is locked (test)"); });
+    let away: ReturnType<typeof modes.get>;
+    try { away = modes.apply("alex", "away-from-desk", {}, "op").application; } finally { clear.mockRestore(); }
+    expect(away!.effects[0]).toMatchObject({ consumer: "quiet", state: "active", prior: null });
+    expect(modes.get(asleep.applicationId)!.effects[0]).toMatchObject({ state: "handed-off",
+      detail: `handed to away-from-desk (${away!.applicationId}), which restores no quiet hours when it ends` });
+    modes.end("alex", "back", "op");
+    expect(f.quiet.show("alex"), "neither mode's rule is left behind").toBeNull();
+    expect(modes.unresolved("alex")).toEqual([]);
+  });
+
   it("a restore that fails is failed, not ended", async () => {
     const f = fixture();
     const real = registryAvailability(f.home);
