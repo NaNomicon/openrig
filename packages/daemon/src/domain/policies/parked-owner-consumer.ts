@@ -72,6 +72,8 @@ export interface ParkedOwnerConsumerDeps {
   /** The seat's live occupant generation, null when unknown. A delivered wake makes a repeat wait only
    *  for the occupant it reached, so without this reader every repeat is sent as on main. */
   occupantGeneration?: (sessionName: string) => string | null;
+  /** The same enforcer's owed turn-boundary/restore/audit state, not an idle-time inference. */
+  hasPendingPostCompactStage?: (sessionName: string) => boolean;
 }
 
 export const PARKED_OWNER_POLICY_NAME = "parked-owner-consumer";
@@ -311,6 +313,12 @@ export function makeParkedOwnerConsumerPolicy(deps: ParkedOwnerConsumerDeps): Po
         const niReason = seat.activity.needsInput.reason ?? "";
         if (/usage.?limit/i.test(niReason)) {
           skipped.push({ seat: seat.sessionName, why: "usage-limit-defer-s16" });
+          continue;
+        }
+
+        // Leave this wake unreserved: the existing next pass can remind the owner after restore/audit.
+        if (deps.hasPendingPostCompactStage?.(seat.sessionName)) {
+          skipped.push({ seat: seat.sessionName, why: "managed-compaction-pending" });
           continue;
         }
 

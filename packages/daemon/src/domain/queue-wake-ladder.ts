@@ -1,4 +1,5 @@
 import type { ArbitratedSeatState } from "./activity-taxonomy.js";
+import { quietHoldCustody } from "./quiet-hold-custody.js";
 import { latestHookMovedOn, latestHookPermissionPending, latestHookWaitsOnPerson } from "./agent-activity-store.js";
 import type { AgentActivity } from "./types.js";
 import type { OperatorDeliveryEngine } from "./gateway/operator-delivery-engine.js";
@@ -347,7 +348,10 @@ function hasPickupEvidence(db: Database.Database, row: Pick<QueueItem, "qitemId"
       // ladder before the resolution pass reads it.
       note.startsWith("slack-owner-notification-") ||
       note.startsWith("delivery-termination:") ||
-      note.startsWith("delivery-deferral-")
+      note.startsWith("delivery-deferral-") ||
+      // Quiet hours: holding an ask and releasing it are delivery machinery too, never someone picking it up.
+      note.startsWith("delivery-decision: quiet-hold ") ||
+      note.startsWith("quiet-release-")
     )
       continue;
     return true;
@@ -760,6 +764,11 @@ export async function runWakeLadderTick(deps: WakeLadderDeps): Promise<WakeLadde
         if (minutesSince(row.tsCreated, now) < windowMin) continue;
         if (hasPickupEvidence(deps.db, row)) continue;
       }
+      // An ask held for quiet hours (or released and waiting for its post) belongs to its window's release job, which
+      // posts it when quiet ends; escalating it would post to the person during quiet. An orphaned hold isn't owned, and
+      // a release whose post failed is an ordinary failed delivery.
+      const quiet = quietHoldCustody(deps.db, row.qitemId, now);
+      if (quiet && (quiet.state === "held" || quiet.state === "released")) continue;
       activeLadders += 1;
 
       // Due-ness: the latest ladder marker (or the original nudge attempt) is older than
@@ -954,7 +963,7 @@ export function makePromptStateReader(deps: {
     const hook = deps.getLatestHook?.(destination), runtime = node?.runtime ?? null;
     if (latestHookWaitsOnPerson(hook, runtime) || latestHookPermissionPending(hook, runtime)) return "blocked";
     if (
-      runtime === "codex" && hook?.rawEvent === "PermissionPromptCleared" &&
+      (runtime === "codex" || runtime === "claude-code") && hook?.rawEvent === "PermissionPromptCleared" &&
       hook.evidenceSource === "runtime_hook" &&
       (hook.stale !== true || hook.reason === "stale_runtime_hook") &&
       Date.parse(hook.eventAt ?? "") > Date.parse(refusedAt)
@@ -966,6 +975,10 @@ export function makePromptStateReader(deps: {
 const PROMPT_ALERT_TAG = "wake-prompt-refusal";
 const PROMPT_EPISODE_TAG = "prompt-episode:";
 const PROMPT_RETIRED_NOTE = "prompt escalation retired: prompt cleared or original episode ended; not a delivery receipt";
+/** Rows whose tag text could hold the prompt alert tag: valid JSON stores a string verbatim or with backslash
+ * escapes, so this superset (LIKE also ignores case) loses no row the exact json_each test below accepts. It only
+ * spares JSON parsing of the rows that cannot match. The alert tag holds no LIKE wildcard. */
+const PROMPT_ALERT_ROWS = `(tags LIKE '%"${PROMPT_ALERT_TAG}"%' OR tags LIKE '%\\%')`;
 
 /** Positive refusals enter the existing rungs without ever retrying the blocked
  * seat. One aggregate carries the episode's obligations and notification key;
@@ -999,6 +1012,19 @@ async function advancePromptRefusals(
       AND json_valid(a.tags) AND EXISTS (SELECT 1 FROM json_each(a.tags) WHERE value = ?)
       AND EXISTS (SELECT 1 FROM json_each(a.tags) WHERE value = 'recovery-for:' || q.qitem_id)))`)
     .all(`${REFUSED_PREFIX}%`, PROMPT_ALERT_TAG) as Array<{ qitem_id: string; destination_session: string }>;
+  // Every tag value of every closed (terminal) prompt alert, read once per tick when the first episode needs it,
+  // rather than one scan of all terminal rows per open episode. The row predicates are the per-episode lookup's;
+  // membership is the same exact json_each value equality; and nothing below writes before the last episode is
+  // checked, so every episode sees the snapshot its own lookup would have read.
+  let closedAlertTags: Set<unknown> | undefined;
+  const closedEpisode = (episodeTag: string): boolean => {
+    closedAlertTags ??= new Set((deps.db.prepare(`WITH closed AS MATERIALIZED (
+        SELECT tags FROM queue_items WHERE ${PROMPT_ALERT_ROWS} AND state NOT IN ('pending','in-progress','blocked')
+          AND json_valid(tags) AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?))
+      SELECT j.value FROM closed, json_each(closed.tags) j`)
+      .all(PROMPT_ALERT_TAG) as Array<{ value: unknown }>).map(row => row.value));
+    return closedAlertTags.has(episodeTag);
+  };
   for (const { qitem_id, destination_session } of candidates) {
     const primary = readCandidate(qitem_id, destination_session);
     if (!primary) continue;
@@ -1008,10 +1034,7 @@ async function advancePromptRefusals(
       if (!episode.key.startsWith(`${primary.destinationSession}|`)) continue;
       // A closed disposition for this exact episode is final, even while the
       // original work remains open. Only a new refusal key can start again.
-      if (deps.db.prepare(`SELECT 1 FROM queue_items WHERE state NOT IN ('pending','in-progress','blocked')
-        AND json_valid(tags) AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?)
-        AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?) LIMIT 1`)
-        .get(PROMPT_ALERT_TAG, `${PROMPT_EPISODE_TAG}${episode.key}`)) continue;
+      if (closedEpisode(`${PROMPT_EPISODE_TAG}${episode.key}`)) continue;
       const rows = episode.ids.map(id => readCandidate(id, primary.destinationSession)).filter((row): row is QueueItem =>
         Boolean(row && row.destinationSession === primary.destinationSession && ["pending", "in-progress", "blocked"].includes(row.state)));
       if (!rows.length) continue;

@@ -1,5 +1,4 @@
 import { ClaudeCodeAdapter } from "../src/adapters/claude-code-adapter.js";
-import * as crypto from "node:crypto";
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createFullTestDb } from "./helpers/test-app.js";
@@ -11,13 +10,12 @@ import { SeatDeliveryGuard } from "../src/domain/seat-delivery-guard.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { SessionTransport } from "../src/domain/session-transport.js";
 import { startupSubmissionEvidence } from "../src/domain/startup-submission-evidence.js";
-import { StartupOrchestrator, type StartupInput } from "../src/domain/startup-orchestrator.js";
+import { StartupOrchestrator, startupProofHeldBackWarning, type StartupInput } from "../src/domain/startup-orchestrator.js";
 import { STARTUP_PROOF_INSTRUCTION_LINE } from "../src/domain/startup-proof.js";
 import type { RuntimeAdapter } from "../src/domain/runtime-adapter.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
 
 // A mockable wrapper is needed because native ESM namespace exports are immutable.
-vi.mock("node:crypto", async (importOriginal) => ({ ...await importOriginal<typeof import("node:crypto")>() }));
 
 describe("startup prompt submission", () => {
   const dbs: ReturnType<typeof createFullTestDb>[] = [];
@@ -291,7 +289,7 @@ describe("startup prompt submission", () => {
     expect(await f.start()).toMatchObject({ ok: true, submission: { status: "unverified", reasons: [expect.stringContaining("capture is unavailable")] } });
     const event = f.db.prepare("SELECT payload FROM events WHERE type = 'node.startup_ready' ORDER BY seq DESC LIMIT 1").get() as { payload: string };
     expect(JSON.parse(event.payload).submission).toMatchObject({ status: "unverified", reasons: [expect.stringContaining("capture is unavailable")],
-      diagnostics: [{ retry: "not_run", observations: [{ phase: "initial", observed: null, firstDifferenceByte: null }] }] });
+      diagnostics: [{ retry: "not_run", observations: [{ phase: "initial" }] }] });
     expect(f.tmux.sendKeys).toHaveBeenCalledTimes(1);
   });
 
@@ -442,14 +440,13 @@ describe("startup prompt submission", () => {
   });
   // Our collapsed paste is looked at again, 200 ms apart, at most this many times per send.
   const SETTLE_LOOKS = 25;
-  const labelBytes = (sent: string) => ({ bytes: `[Pastedtext#1+${newlines(sent)}lines]`.length });
   it("keeps our collapsed paste unverified if it never clears, with both ends of the wait in the diagnostic", async () => {
     const f = fixture(0, "claude-code", true);
     f.tmux.capturePaneContent.mockImplementation(async () => ownPaste(sentPrompt(f)));
     const result = await f.start({ startupActions: proofActions(false) });
     expect(result).toMatchObject({ ok: true, startupStatus: "ready", submission: { status: "unverified", reasons: [
       "Startup submission is unverified: the current composer does not positively match the complete prompt.",
-      "Startup proof instruction was not sent: the startup prompt was not confirmed submitted.",
+      startupProofHeldBackWarning("the input box did not clearly show the prompt as submitted"),
     ] } });
     expect(f.submitted.includes(STARTUP_PROOF_INSTRUCTION_LINE)).toBe(false);
     expect(f.tmux.sendKeys).toHaveBeenCalledTimes(1);
@@ -457,8 +454,8 @@ describe("startup prompt submission", () => {
     // paste to Enter, Enter to the first look, then the re-looks: about 5 s per send, never unbounded
     expect(f.sleep.mock.calls).toEqual(Array.from({ length: 2 + SETTLE_LOOKS }, () => [200]));
     expect(result.ok && result.submission?.diagnostics).toMatchObject([{ retry: "not_run", observations: [
-      { phase: "initial", look: 0, reason: "extracted_text_mismatch", observed: labelBytes(sentPrompt(f)) },
-      { phase: "initial", look: SETTLE_LOOKS, reason: "extracted_text_mismatch", observed: labelBytes(sentPrompt(f)) },
+      { phase: "initial", look: 0, reason: "extracted_text_mismatch" },
+      { phase: "initial", look: SETTLE_LOOKS, reason: "extracted_text_mismatch" },
     ] }]);
   });
   it("hands our collapsed paste that settles to the staged prompt to the guarded Enter-only retry", async () => {
@@ -496,7 +493,7 @@ describe("startup prompt submission", () => {
     expect(result).toMatchObject({ ok: true, submission: { status: "unverified",
       reasons: ["Startup submission is unverified: the current composer does not positively match the complete prompt."] } });
     const observations = result.ok ? result.submission?.diagnostics?.[0]?.observations : undefined;
-    expect(observations).toMatchObject([{ phase: "initial", reason: "extracted_text_mismatch", observed: labelBytes(sentPrompt(f)) }]);
+    expect(observations).toMatchObject([{ phase: "initial", reason: "extracted_text_mismatch" }]);
     expect(observations?.[0]).not.toHaveProperty("look");
     expect(f.tmux.capturePaneContent).toHaveBeenCalledTimes(2);
   });
@@ -511,7 +508,9 @@ describe("startup prompt submission", () => {
         expect(f.tmux.sendText).toHaveBeenCalledTimes(1);
         expect(f.submitted).toHaveLength(0);
         expect(f.composer()).toBe(f.tmux.sendText.mock.calls[0]![1]);
-        expect(result.ok && result.submission?.reasons).toContain("Startup proof instruction was not sent: the startup prompt was not confirmed submitted.");
+        expect(result.ok && result.submission?.reasons).toContain(startupProofHeldBackWarning(observation === "unavailable"
+          ? "the input box could not be observed"
+          : "the input box did not clearly show the prompt as submitted"));
       });
     }
     it(`sends the proof line as its own submission after a confirmed ${path} prompt`, async () => {
@@ -523,9 +522,11 @@ describe("startup prompt submission", () => {
     });
     it(`keeps a staged ${path} prompt pending and sends no proof line`, async () => {
       const f = fixture(Infinity, "claude-code", !identity);
-      expect(await f.start({ startupActions: proofActions(identity) })).toMatchObject({ ok: true, startupStatus: "ready", submission: { status: "staged" } });
+      const result = await f.start({ startupActions: proofActions(identity) });
+      expect(result).toMatchObject({ ok: true, startupStatus: "ready", submission: { status: "staged" } });
       expect(f.tmux.sendText).toHaveBeenCalledTimes(1);
       expect(f.submitted).toHaveLength(0);
+      expect(result.ok && result.submission?.reasons).toContain(startupProofHeldBackWarning("the prompt still looked staged in the input box"));
     });
   }
   it("a Codex challenge stays one submission with no proof line", async () => {
@@ -557,7 +558,6 @@ describe("startup prompt submission", () => {
   });
 
   const screen = (body: string) => `Previous turn\n❯ ${body}\n────────────────────\n? for shortcuts`;
-  const digest = (text: string) => ({ bytes: Buffer.byteLength(text), sha256: crypto.createHash("sha256").update(text).digest("hex") });
 
   it.each(["initial", "after_retry"])("labels an unrecognized composer boundary at %s without changing submission", async (phase) => {
     const f = fixture(phase === "initial" ? 0 : 1);
@@ -574,7 +574,7 @@ describe("startup prompt submission", () => {
     expect(submission).toMatchObject({ status: "unverified", reasons: [reason], diagnostics: [{
       retry: phase === "initial" ? "not_run" : "ok",
       observations: [{ phase, reason: "unrecognized_composer_boundary", markerLine: 2,
-        closingRuleLine: null, observed: null, firstDifferenceByte: null }],
+        closingRuleLine: null }],
     }] });
     expect(f.tmux.sendText).toHaveBeenCalledTimes(1);
     expect(f.tmux.sendKeys).toHaveBeenCalledTimes(phase === "initial" ? 1 : 2);
@@ -592,9 +592,7 @@ describe("startup prompt submission", () => {
     expect(submission.reasons).toEqual(["Startup submission is unverified: the current composer does not positively match the complete prompt."]);
     expect(submission.diagnostics).toEqual([{
       startupAttemptId: expect.stringMatching(/^[0-9a-f-]{36}$/), sendOrder: 1, source: "initial_identity", retry: "not_run",
-      observations: [{ phase: "initial", reason: "extracted_text_mismatch", normalization: "whitespace-stripped-utf8",
-        expected: digest(f.tmux.sendText.mock.calls[0]![1].replace(/\s+/g, "")), observed: digest("Xäb"),
-        firstDifferenceByte: 0, markerLine: 2, closingRuleLine: 4, capturedLines: 5,
+      observations: [{ phase: "initial", reason: "extracted_text_mismatch", markerLine: 2, closingRuleLine: 4, capturedLines: 5,
         captureScrollbackLines: 200, windowsOmitted: "unclassified-startup-text" }],
     }]);
     expect(f.tmux.capturePaneContent).toHaveBeenCalledTimes(1);
@@ -608,7 +606,7 @@ describe("startup prompt submission", () => {
     f.tmux.capturePaneContent.mockImplementationOnce(capture)
       .mockResolvedValueOnce(screen("different text")).mockResolvedValueOnce(screen(""));
     expect(await f.start()).toMatchObject({ ok: true, submission: { diagnostics: [{
-      retry: "refused_or_failed", observations: [{ phase: "guarded_retry", reason: "extracted_text_mismatch", observed: digest("differenttext") }],
+      retry: "refused_or_failed", observations: [{ phase: "guarded_retry", reason: "extracted_text_mismatch" }],
     }] } });
     expect(f.tmux.capturePaneContent).toHaveBeenCalledTimes(3);
     expect(f.tmux.sendKeys).toHaveBeenCalledTimes(1);
@@ -619,7 +617,7 @@ describe("startup prompt submission", () => {
     const capture = f.tmux.capturePaneContent.getMockImplementation()!;
     f.tmux.capturePaneContent.mockImplementationOnce(capture).mockImplementationOnce(capture).mockResolvedValueOnce(null);
     expect(await f.start()).toMatchObject({ ok: true, submission: { status: "unverified", diagnostics: [{
-      retry: "ok", observations: [{ phase: "after_retry", observed: null }],
+      retry: "ok", observations: [{ phase: "after_retry" }],
     }] } });
     expect(f.tmux.sendKeys).toHaveBeenCalledTimes(2);
   });
@@ -629,7 +627,7 @@ describe("startup prompt submission", () => {
     const capture = f.tmux.capturePaneContent.getMockImplementation()!;
     f.tmux.capturePaneContent.mockImplementationOnce(capture).mockRejectedValueOnce(new Error("unavailable"));
     expect(await f.start()).toMatchObject({ ok: true, submission: { diagnostics: [{
-      retry: "refused_or_failed", observations: [{ phase: "guarded_retry", observed: null }],
+      retry: "refused_or_failed", observations: [{ phase: "guarded_retry" }],
     }] } });
     expect(f.tmux.sendKeys).toHaveBeenCalledTimes(1);
   });
@@ -668,19 +666,18 @@ describe("startup prompt submission", () => {
     ];
     expect(await f.start({ startupActions: actions })).toMatchObject({ ok: false, startupStatus: "failed" });
     const event = f.db.prepare("SELECT payload FROM events WHERE type = 'node.startup_failed'").get() as { payload: string };
-    expect(JSON.parse(event.payload).submissionDiagnostics).toMatchObject([{ sendOrder: 1, retry: "not_run", observations: [{ observed: null }] }]);
+    expect(JSON.parse(event.payload).submissionDiagnostics).toMatchObject([{ sendOrder: 1, retry: "not_run", observations: [{ phase: "initial" }] }]);
   });
 
-  it("keeps diagnostics bounded for a large synthetic prompt and uses UTF-8 byte offsets", () => {
+  it("keeps diagnostics bounded for a large synthetic prompt, with no digests of the prompt or the composer", () => {
     const body = "ä" + "x".repeat(200_000);
     const evidence = startupSubmissionEvidence(screen(body), "äy" + "x".repeat(200_000), 200)!;
-    expect(evidence.firstDifferenceByte).toBe(2);
-    expect(evidence.observed).toEqual(digest(body));
-    expect(evidence.expected.bytes).toBe(200_003);
+    expect(evidence.reason).toBe("extracted_text_mismatch");
+    for (const field of ["normalization", "expected", "observed", "firstDifferenceByte"]) expect(evidence).not.toHaveProperty(field);
     expect(JSON.stringify(evidence).length).toBeLessThan(700);
     expect(JSON.stringify(evidence)).not.toContain("xxxxx");
+    expect(startupSubmissionEvidence(screen("same"), "s a m e", 200)?.reason).toBeUndefined();
     const selector = startupSubmissionEvidence("❯ 1. Continue\n────────────────────\n? for shortcuts", "1. Continue", 200)!;
-    expect(selector.observed).toBeNull();
     expect(selector.reason).toBeUndefined();
     expect(startupSubmissionEvidence(null, "expected", 200)?.reason).toBeUndefined();
   });
@@ -700,13 +697,17 @@ describe("startup prompt submission", () => {
     expect(f.tmux.capturePaneContent).toHaveBeenCalledTimes(1);
   });
 
-  it("does not change the delivery verdict when diagnostic hashing fails", async () => {
-    const f = fixture(Infinity);
-    f.tmux.capturePaneContent.mockResolvedValue(screen("different composer"));
-    vi.spyOn(crypto, "createHash").mockImplementation(() => { throw new Error("diagnostic failure"); });
-    expect(await f.start()).toMatchObject({ ok: true, startupStatus: "ready", submission: { status: "unverified" } });
-    expect(f.tmux.sendKeys).toHaveBeenCalledTimes(1);
-    expect(f.tmux.capturePaneContent).toHaveBeenCalledTimes(1);
-  });
+});
 
+describe("startupProofHeldBackWarning (#1623)", () => {
+  it("says only the extra line was held back, why, and that the startup prompt itself was sent", () => {
+    const warning = startupProofHeldBackWarning("the prompt still looked staged in the input box");
+    expect(warning).toMatch(/^Startup proof instruction held back: only the extra line/);
+    expect(warning).toContain("nothing is typed over input that may still be in the box");
+    expect(warning).toContain("The startup prompt itself was sent");
+    expect(warning).toMatch(/could not be confirmed: the prompt still looked staged in the input box\.$/);
+  });
+  it("still reads as a held-back line when no specific reason was recorded", () => {
+    expect(startupProofHeldBackWarning(undefined)).toMatch(/could not be confirmed: it was not observed submitted\.$/);
+  });
 });

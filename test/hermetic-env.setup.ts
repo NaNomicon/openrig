@@ -29,7 +29,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { writeRuntimeStubs } from "./stub-runtimes.js";
+import { realRuntimesRequested, writeRuntimeStubs } from "./stub-runtimes.js";
 
 // Scrub inherited instance selectors before product modules capture their defaults.
 // Tests can still set explicit overrides after setup; test/provider opt-in flags
@@ -47,6 +47,7 @@ for (const key of [
   "PROVIDER_USAGE_WINDOWS",
   // A seat with input-box verification on must not change what the transport suites verify.
   "TRANSPORT_VERIFY_INPUT_BOX",
+  "TRANSPORT_LOCAL_USER_GUARD",
 ]) {
   delete process.env[`OPENRIG_${key}`];
   delete process.env[`RIGGED_${key}`];
@@ -106,11 +107,20 @@ if (createdHome) {
 }
 process.env["OPENRIG_HOME"] = fixtureHome;
 delete process.env["RIGGED_HOME"];
+// Compaction packets default to the shared /tmp/claude-compaction-restore that real seats use. Give every test a
+// folder under the fixture home instead (removed with it), so a test that forgets its own root can't write there
+// and a seat's value can't reach the suite. Tests that set their own root still do.
+process.env["OPENRIG_COMPACTION_OUT_ROOT"] = path.join(fixtureHome, "compaction-packets");
 // Legacy ~/.rigged discovery and ordinary home-based config must also stay local
 // to this fixture. Merely changing HOME would not override OPENRIG_HOME or DB.
 // Keep ordinary user files outside the state root, as in a real installation.
 // Otherwise file-transfer correctly rejects every ~/ path as OpenRig state.
-if (process.env["OPENRIG_E2E_REAL_CODEX"] !== "1") {
+// Vitest sets testPath before setupFiles. Plain Node setup consumers have no native-runtime exception.
+const testPath = process.env["VITEST"] ? (await import("vitest")).expect.getState().testPath : undefined;
+const realCodexTest = realRuntimesRequested(process.env, testPath);
+// These files exercise Codex only; an inherited Claude override never belongs to their fixture.
+delete process.env["CLAUDE_CONFIG_DIR"];
+if (!realCodexTest) {
   const userHome = `${fixtureHome}-user-home`;
   fs.mkdirSync(userHome, { recursive: true });
   process.env["HOME"] = userHome;
@@ -119,6 +129,11 @@ if (process.env["OPENRIG_E2E_REAL_CODEX"] !== "1") {
     XDG_CONFIG_HOME: ".config", XDG_STATE_HOME: ".local/state",
     XDG_DATA_HOME: ".local/share", XDG_CACHE_HOME: ".cache",
   })) process.env[key] = path.join(userHome, suffix);
+
+  if (os.homedir() !== userHome || process.env["CODEX_HOME"] !== undefined
+    || process.env["CLAUDE_CONFIG_DIR"] !== undefined) {
+    throw new Error("test provider homes must stay inside the fixture");
+  }
 
   // codex and claude resolve to stubs that answer at once, so no test runs the host's real
   // binaries (a codex wrapper that hangs under a fixture HOME leaves its probes running).

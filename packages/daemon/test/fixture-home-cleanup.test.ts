@@ -21,7 +21,10 @@ function runSetup(env: Record<string, string | undefined> = {}) {
     env: { PATH: process.env.PATH, TMPDIR: tmp, ...env },
   });
   expect(child.status, child.stderr).toBe(0);
-  const homes = JSON.parse(child.stdout.trim().split("\n").pop()!) as { openrigHome: string; home: string; tmpdir: string; scratch: string };
+  const homes = JSON.parse(child.stdout.trim().split("\n").pop()!) as {
+    openrigHome: string; home: string; tmpdir: string; scratch: string;
+    osHome: string; codexHome?: string; claudeConfigDir?: string; xdgConfig: string; codexVersion: string;
+  };
   return { tmp, ...homes };
 }
 const fixtureEntries = (tmp: string) => fs.readdirSync(tmp).filter((name) => name.startsWith(".openrig-test-fixture-home-"));
@@ -29,7 +32,22 @@ const fixtureEntries = (tmp: string) => fs.readdirSync(tmp).filter((name) => nam
  *  Not tsx's loader cache, which the child's launcher makes before the setup runs. */
 const leftovers = (tmp: string) => fs.readdirSync(tmp).filter((name) => !name.startsWith("tsx-"));
 
-describe.skipIf(process.env["OPENRIG_E2E_REAL_CODEX"] === "1")("fixture homes are removed when the worker exits", () => {
+describe("fixture homes are removed when the worker exits", () => {
+  it.each([undefined, "1"])("isolates provider homes and runtime lookup with native opt-in=%s", optIn => {
+    const { tmp, openrigHome, home, osHome, codexHome, claudeConfigDir, xdgConfig, codexVersion } = runSetup({
+      HOME: "/synthetic-host-home", CODEX_HOME: "/synthetic-host-codex",
+      CLAUDE_CONFIG_DIR: "/synthetic-host-claude", XDG_CONFIG_HOME: "/synthetic-host-xdg",
+      OPENRIG_E2E_REAL_CODEX: optIn,
+    });
+    expect(home).toBe(`${openrigHome}-user-home`);
+    expect(osHome).toBe(home);
+    expect(codexHome).toBeUndefined();
+    expect(claudeConfigDir).toBeUndefined();
+    expect(xdgConfig).toBe(path.join(home, ".config"));
+    expect(codexVersion).toBe("codex-cli 0.139.0");
+    expect(leftovers(tmp)).toEqual([]);
+  });
+
   it("removes the fixture home and the user home", () => {
     const { tmp, openrigHome, home } = runSetup();
     expect(path.dirname(openrigHome)).toBe(tmp);

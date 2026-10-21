@@ -16,9 +16,11 @@ import { WORKSPACE_KINDS } from "./types.js";
 import { validateSafePath } from "./path-safety.js";
 import { CLAUDE_MANAGED_BLOCK_FILES } from "./managed-blocks.js";
 import { canonicalCompactionStrategy, canonicalContinuityMechanic } from "./agent-manifest.js";
+import { unknownLevelWarning } from "./seat-effort.js";
 import { aliasModelPinAdvisory } from "./spec-validation-advisory.js";
 import { normalizeSeatEnv, validateSeatEnv } from "./seat-env.js";
 import { validatePermissionPolicyRef } from "./permission-policy/policy-ref.js";
+import { deriveCanonicalSessionName } from "./session-name.js";
 import { validateStartupBlock, normalizeStartupBlock } from "./startup-validation.js";
 import { COMPOSE_PROJECT_NAME_PATTERN, deriveComposeProjectName } from "./compose-project-name.js";
 import * as path from "node:path";
@@ -202,6 +204,7 @@ export class RigSpecSchema {
         const pod = pods[pi]!;
         errors.push(...validatePod(pod, pi, podIds, advisories));
       }
+      advisories.push(...sessionNameCollisions(obj));
 
       // Cross-pod edge validation
       const allQualifiedIds = new Set<string>(opts?.externalQualifiedIds ?? []);
@@ -383,6 +386,31 @@ function normalizeWorkspaceBlock(raw: unknown): WorkspaceSpec | undefined {
 
 // -- Pod validation --
 
+/**
+ * Members in different pods can derive one session name (pod "a-b" + member "c" and pod "a" + member "b-c").
+ * A warning, not an error: `rig spec validate` and `rig up --plan` report it.
+ */
+export function sessionNameCollisions(spec: unknown): string[] {
+  const warnings: string[] = [];
+  if (!isMapping(spec) || !Array.isArray(spec["pods"])) return warnings;
+  const owners = new Map<string, string>();
+  const rig = typeof spec["name"] === "string" ? spec["name"] : "";
+  (spec["pods"] as unknown[]).forEach((pod, pi) => {
+    if (!isMapping(pod) || typeof pod["id"] !== "string" || !Array.isArray(pod["members"])) return;
+    (pod["members"] as unknown[]).forEach((member, mi) => {
+      if (!isMapping(member) || typeof member["id"] !== "string") return;
+      const sessionName = deriveCanonicalSessionName(pod["id"] as string, member["id"] as string, rig);
+      const owner = owners.get(sessionName);
+      const qualifiedId = `${pod["id"]}.${member["id"]}`;
+      if (owner === undefined) owners.set(sessionName, qualifiedId);
+      else if (owner !== qualifiedId) {
+        warnings.push(`pods[${pi}].members[${mi}].id: session name "${sessionName}" is already used by member "${owner}"`);
+      }
+    });
+  });
+  return warnings;
+}
+
 function validatePod(pod: Record<string, unknown>, index: number, podIds: Set<string>, advisories: string[]): string[] {
   const errors: string[] = [];
   const prefix = `pods[${index}]`;
@@ -496,6 +524,9 @@ function validateMember(member: Record<string, unknown>, index: number, podPrefi
   if (member["effort"] !== undefined) {
     if (typeof member["effort"] !== "string" || !member["effort"].trim()) {
       advisories.push(`${prefix}.effort: non-string value "${member["effort"]}" ignored; effort must be a text value`);
+    } else if (member["runtime"] === "pi") {
+      const warning = unknownLevelWarning("pi", member["effort"].trim());
+      if (warning) advisories.push(`${prefix}.effort: ${warning}`);
     }
   }
   if (!member["cwd"] || typeof member["cwd"] !== "string") {
@@ -900,6 +931,7 @@ function validateServicesBlock(raw: unknown, prefix: string): string[] {
 }
 
 function validateWaitTarget(raw: Record<string, unknown>, index: number, prefix: string): string[] {
+  if (!isMapping(raw)) return [`${prefix}.wait_for[${index}]: must be an object`];
   const errors: string[] = [];
   const targetPrefix = `${prefix}.wait_for[${index}]`;
   const hasService = typeof raw["service"] === "string" && raw["service"];
@@ -939,6 +971,10 @@ function validateSurfaces(raw: unknown, prefix: string): string[] {
     } else {
       for (let i = 0; i < (obj["urls"] as unknown[]).length; i++) {
         const url = (obj["urls"] as Record<string, unknown>[])[i]!;
+        if (!isMapping(url)) {
+          errors.push(`${prefix}.surfaces.urls[${i}]: must be an object`);
+          continue;
+        }
         if (!url["name"] || typeof url["name"] !== "string") {
           errors.push(`${prefix}.surfaces.urls[${i}].name: required non-empty string`);
         }
@@ -955,6 +991,10 @@ function validateSurfaces(raw: unknown, prefix: string): string[] {
     } else {
       for (let i = 0; i < (obj["commands"] as unknown[]).length; i++) {
         const command = (obj["commands"] as Record<string, unknown>[])[i]!;
+        if (!isMapping(command)) {
+          errors.push(`${prefix}.surfaces.commands[${i}]: must be an object`);
+          continue;
+        }
         if (!command["name"] || typeof command["name"] !== "string") {
           errors.push(`${prefix}.surfaces.commands[${i}].name: required non-empty string`);
         }
@@ -975,6 +1015,10 @@ function validateCheckpointHooks(raw: unknown, prefix: string): string[] {
   const errors: string[] = [];
   for (let i = 0; i < raw.length; i++) {
     const hook = raw[i] as Record<string, unknown>;
+    if (!isMapping(hook)) {
+      errors.push(`${prefix}.checkpoints[${i}]: must be an object`);
+      continue;
+    }
     if (!hook["id"] || typeof hook["id"] !== "string") {
       errors.push(`${prefix}.checkpoints[${i}].id: required non-empty string`);
     }
@@ -1271,6 +1315,9 @@ export class LegacyRigSpecSchema {
         if (node["effort"] !== undefined) {
           if (typeof node["effort"] !== "string" || !node["effort"].trim()) {
             advisories.push(`nodes.${nodeWhere}.effort: non-string value "${node["effort"]}" ignored; effort must be a text value`);
+          } else if (node["runtime"] === "pi") {
+            const warning = unknownLevelWarning("pi", node["effort"].trim());
+            if (warning) advisories.push(`nodes.${nodeWhere}.effort: ${warning}`);
           }
         }
 
