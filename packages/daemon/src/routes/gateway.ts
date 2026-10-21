@@ -27,6 +27,7 @@ import { buildSlackAppManifest } from "../domain/gateway/slack/manifest.js";
 import { authBearerTokenMiddleware } from "../middleware/auth-bearer-token.js";
 import type Database from "better-sqlite3";
 import { HumanQuietStore, QuietWindowError, parseDailyRule, resolveUntil } from "../domain/gateway/human-quiet-windows.js";
+import { HumanModeService, ModeError, registryAvailability, type QuietRule } from "../domain/gateway/human-operating-modes.js";
 
 interface SubsystemHandle {
   restart: () => void;
@@ -141,6 +142,74 @@ export function gatewayRoutes(opts: {
     ({ ended: quiet.end(entityId, { endedBy: actor, now: at }) })));
   app.post("/human/:entityId/quiet/clear", quietRoute("clearing quiet hours", ({ quiet, entityId, actor, at }) =>
     ({ cleared: quiet.clear(entityId, { clearedBy: actor, now: at }) })));
+
+  // Operating modes for a person: saved modes and the record of applying one. Same person check and actor as quiet
+  // hours; applying or ending touches only the person's availability, their quiet window and the modes' own records.
+  const modeRoute = (verb: string, handler: (input: { modes: HumanModeService; entityId: string; name: string; actor: string;
+    body: Record<string, unknown>; at: Date }) => unknown) =>
+    async (c: import("hono").Context) => {
+      const entityId = c.req.param("entityId") ?? "";
+      const db = c.get("db" as never) as Database.Database | undefined;
+      if (!db) return c.json({ error: "modes_unavailable", message: "The daemon's database isn't available to this route." }, 503);
+      const home = opts.home ?? OPENRIG_HOME;
+      const registry = loadHumanRegistry(home);
+      if (!registry.ok) return c.json({ error: "human_registry_unavailable", message: registry.error }, 503);
+      if (!registry.entities.some((candidate) => candidate.entityId === entityId)) return c.json({ error: "human_not_found", entityId }, 404);
+      const body = c.req.method === "GET" ? {} : ((await c.req.json<Record<string, unknown>>().catch(() => ({}))) ?? {});
+      let actor = "";
+      if (c.req.method !== "GET") {
+        const identity = requireSenderIdentity(c, { verb, bodyClaim: typeof body.actor === "string" ? body.actor : null });
+        if (!identity.ok) return identity.response;
+        actor = identity.session;
+      }
+      const at = now();
+      const modes = new HumanModeService({ db, availability: registryAvailability(home), now: () => at });
+      try {
+        return c.json({ ok: true, entityId, ...(handler({ modes, entityId, name: c.req.param("name") ?? "", actor, body, at }) as Record<string, unknown>) });
+      } catch (error) {
+        if (error instanceof ModeError) return c.json({ error: error.code, message: error.message }, error.code === "mode_not_found" ? 404 : 400);
+        if (error instanceof QuietWindowError) return c.json({ error: error.code, message: error.message }, 400);
+        throw error;
+      }
+    };
+  const text = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v.trim() : null);
+  app.get("/human/:entityId/modes", modeRoute("reading modes", ({ modes, entityId }) =>
+    ({ modes: modes.list(entityId), current: modes.current(entityId) })));
+  app.get("/human/:entityId/modes/:name", modeRoute("reading a mode", ({ modes, entityId, name }) => {
+    const mode = modes.saved(entityId, name);
+    if (!mode) throw new ModeError("mode_not_found", `${entityId} has no saved mode "${name}"`);
+    return { mode };
+  }));
+  app.put("/human/:entityId/modes/:name", modeRoute("saving a mode", ({ modes, entityId, name, actor, body }) => {
+    const quietText = text(body.quiet);
+    const timezone = text(body.timezone) ?? "";
+    let quiet: QuietRule | null = null;
+    if (quietText === "until-end") quiet = { kind: "until-end", timezone };
+    else if (quietText) quiet = { kind: "daily", ...parseDailyRule(quietText), timezone };
+    const exclusions = Array.isArray(body.exclusions) ? body.exclusions.filter((e): e is string => typeof e === "string" && e.trim() !== "").map((e) => e.trim()) : [];
+    return { mode: modes.save(entityId, {
+      name,
+      availability: { value: text(body.availability), expectedBack: text(body.expectedBack) },
+      decisionRoom: { words: text(body.decisionRoom), exclusions },
+      delivery: { quiet, account: text(body.account) },
+    }, actor) };
+  }));
+  app.post("/human/:entityId/modes/:name/apply", modeRoute("applying a mode", ({ modes, entityId, name, actor, body, at }) => {
+    const until = text(body.until);
+    const saved = modes.saved(entityId, name);
+    const timezone = text(body.timezone) ?? (saved?.delivery.quiet?.timezone || "UTC");
+    const result = modes.apply(entityId, name, { scheduledEnd: until ? resolveUntil(until, timezone, at) : null }, actor);
+    return { application: result.application, ended: result.ended, atDesk: result.application === null };
+  }));
+  app.get("/human/:entityId/mode", modeRoute("reading the current mode", ({ modes, entityId }) => {
+    const current = modes.current(entityId);
+    return { current, atDesk: current === null };
+  }));
+  app.post("/human/:entityId/mode/end", modeRoute("ending a mode", ({ modes, entityId, actor, body }) => {
+    const reason = body.reason === "scheduled" ? "scheduled" : "back";
+    const ended = modes.end(entityId, reason, actor);
+    return { ended, atDesk: modes.current(entityId) === null };
+  }));
 
   app.post("/slack/:operation", async (c) => {
     const operation = c.req.param("operation");

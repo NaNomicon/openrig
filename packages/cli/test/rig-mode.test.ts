@@ -597,3 +597,57 @@ describe("rig mode: legacy record fields marked stored, not applied (04-A3)", ()
     expect(marked.sort()).toEqual([...MARKED].sort());
   });
 });
+
+// Slice 04 (OPR.0.7.0.4) 04-B1 — a person's own modes: save, show, apply, current and end call the person's mode routes
+// and print each effect's real state. The legacy commands above are unchanged.
+describe("rig mode: a person's saved modes and their application (04-B1)", () => {
+  const application = { applicationId: "a-1", modeName: "asleep", startedAt: "2026-10-20T21:00:00.000Z", scheduledEnd: "2026-10-21T07:00:00.000Z",
+    endedAt: null, endReason: null, effects: [
+      { consumer: "availability", state: "active", detail: null },
+      { consumer: "decision-room", state: "active", detail: null },
+      { consumer: "quiet", state: "failed", detail: "unknown timezone" },
+    ] };
+  function personClient(data: Record<string, unknown>, status = 200) {
+    const calls: Array<{ method: string; path: string; body?: Record<string, unknown> }> = [];
+    const answer = async () => ({ status, data });
+    const client = {
+      get: vi.fn(async (path: string) => { calls.push({ method: "GET", path }); return answer(); }),
+      put: vi.fn(async (path: string, body: Record<string, unknown>) => { calls.push({ method: "PUT", path, body }); return answer(); }),
+      post: vi.fn(async (path: string, body: Record<string, unknown>) => { calls.push({ method: "POST", path, body }); return answer(); }),
+    };
+    return { client, calls };
+  }
+
+  it("save sends the three settings as given, with no decision room unless one is stated", async () => {
+    const { client, calls } = personClient({ ok: true, mode: { name: "asleep", availability: { value: "away", expectedBack: "07:00" }, decisionRoom: null,
+      delivery: { quiet: { kind: "until-end", timezone: "UTC" }, account: null } } });
+    await rigModeCommand(deps(client)).parseAsync(["node", "rig", "save", "alex", "asleep", "--availability", "away", "--expected-back", "07:00",
+      "--quiet", "until-end", "--tz", "UTC", "--actor", "op"]);
+    expect(calls[0]).toMatchObject({ method: "PUT", path: "/api/gateway/human/alex/modes/asleep",
+      body: { availability: "away", expectedBack: "07:00", decisionRoom: null, exclusions: [], quiet: "until-end", timezone: "UTC" } });
+    expect(logs.join("\n")).toContain("asleep: availability away, back 07:00; decision room none (nothing is decided for them); delivery: quiet until the mode ends (UTC)");
+  });
+
+  it("apply prints each effect's real state, so a failed one never reads as active", async () => {
+    const { client, calls } = personClient({ ok: true, application, ended: null, atDesk: false });
+    await rigModeCommand(deps(client)).parseAsync(["node", "rig", "apply", "alex", "asleep", "--until", "07:00", "--tz", "UTC"]);
+    expect(calls[0]).toMatchObject({ method: "POST", path: "/api/gateway/human/alex/modes/asleep/apply", body: { until: "07:00", timezone: "UTC" } });
+    expect(logs).toEqual(["asleep on since 2026-10-20T21:00:00.000Z, until 2026-10-21T07:00:00.000Z\n  availability: active\n  decision-room: active\n  quiet: failed (unknown timezone)"]);
+  });
+
+  it("current says at desk when no mode is on; end records a scheduled end when asked", async () => {
+    await rigModeCommand(deps(personClient({ ok: true, current: null, atDesk: true }).client)).parseAsync(["node", "rig", "current", "alex"]);
+    expect(logs).toEqual(["alex is at desk: no mode on"]);
+    const { client, calls } = personClient({ ok: true, ended: { ...application, endedAt: "2026-10-21T07:00:00.000Z", endReason: "scheduled",
+      effects: [{ consumer: "quiet", state: "kept", detail: "changed since" }] }, atDesk: true });
+    await rigModeCommand(deps(client)).parseAsync(["node", "rig", "end", "alex", "--scheduled", "--json"]);
+    expect(calls[0]).toMatchObject({ method: "POST", path: "/api/gateway/human/alex/mode/end", body: { reason: "scheduled" } });
+    expect(JSON.parse(logs.at(-1)!)).toMatchObject({ ended: { endReason: "scheduled" } });
+  });
+
+  it("a refusal is reported and exits non-zero", async () => {
+    await rigModeCommand(deps(personClient({ error: "end_required", message: "needs an end time" }, 400).client)).parseAsync(["node", "rig", "apply", "alex", "asleep"]);
+    expect(errs).toEqual(["refused: needs an end time"]);
+    expect(process.exitCode).toBe(1);
+  });
+});

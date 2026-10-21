@@ -565,7 +565,7 @@ export function showHuman(entityId: string, home: string = getOpenRigHome()): Sh
 }
 
 const SETTABLE_FIELDS_TEACHING =
-  "settable fields: display-name, delivery-class, away, binding.<n> (binding.<n> takes a full kind:connectorRef:secretsRef:role[:handle=<id>] spec)";
+  "settable fields: display-name, delivery-class, away, availability (available|focus|away|off, or unset), binding.<n> (binding.<n> takes a full kind:connectorRef:secretsRef:role[:handle=<id>] spec)";
 
 /** Cross-fragment handle-uniqueness: the same pre-write check add runs (one platform id =
  *  one human), extracted so set enforces it identically. */
@@ -585,6 +585,16 @@ function handleConflict(fragment: HumanFragment, home: string): string | undefin
     }
   }
   return undefined;
+}
+
+/** The availability a person's fragment authors, or undefined when it authors none: what a mode records as the prior
+ *  value and checks is still its own. */
+export function readHumanAvailability(entityId: string, home: string = getOpenRigHome()):
+  { ok: true; availability: string | undefined } | { ok: false; error: string } {
+  const f = readFragment(entityId, home);
+  if (!f.ok) return f;
+  const prefs = isObj(f.raw.prefs) ? (f.raw.prefs as Record<string, unknown>) : {};
+  return { ok: true, availability: typeof prefs.availability === "string" ? prefs.availability : undefined };
 }
 
 export function setHumanField(
@@ -611,6 +621,12 @@ export function setHumanField(
       return { ok: false, error: `away must be true|false (got "${value}")` };
     }
     rawPrefs.away = value === "true";
+    raw.prefs = rawPrefs;
+  } else if (field === "availability") {
+    // `unset` removes the authored field, so it reads as never authored (what restoring an absent value needs). Any
+    // other value goes through the add-time validator below: the closed enum, and agreement with legacy `away`.
+    if (value === "unset") delete rawPrefs.availability;
+    else rawPrefs.availability = value;
     raw.prefs = rawPrefs;
   } else if (field.startsWith("binding.")) {
     const idxRaw = field.slice("binding.".length);
