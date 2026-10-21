@@ -91,6 +91,14 @@ export class HumanQuietStore {
     return { windowId: state.windowId, revision: state.revision, occurrence: state.occurrence };
   }
 
+  /** Put an occurrence's ended mark back on the current revision, as end() writes it (no new revision, no source change):
+   *  for a window restored over one whose occurrence the person had already ended, so restoring it doesn't start that
+   *  occurrence's quiet again. Applies only while the revision is still the given one. */
+  restoreEnded(entityId: string, revision: number, ended: { occurrence: string; by: string; at: string }): void {
+    this.db.prepare(`UPDATE human_quiet_windows SET ended_occurrence = ?, ended_by = ?, ended_at = ? WHERE entity_id = ? AND revision = ?`)
+      .run(ended.occurrence, ended.by, ended.at, entityId, revision);
+  }
+
   /** Remove the rule. The row stays, with a new revision, so an older revision is still recognisably stale. */
   clear(entityId: string, input: { clearedBy: string; now: Date }): { windowId: string; revision: number } {
     const row = this.row(entityId);

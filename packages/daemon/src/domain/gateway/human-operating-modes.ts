@@ -71,7 +71,8 @@ export class ModeError extends Error {
 
 /** The two writers a mode changes outside its own tables; tests inject failing ones. */
 export interface AvailabilityAccess {
-  read(entityId: string): { ok: true; availability: string | undefined } | { ok: false; error: string };
+  /** The authored value, and the id of the latest change recorded through the registry's writers (null: none yet). */
+  read(entityId: string): { ok: true; availability: string | undefined; changeId?: string | null } | { ok: false; error: string };
   write(entityId: string, value: Availability | "unset"): { ok: true } | { ok: false; error: string };
 }
 
@@ -191,8 +192,14 @@ export class HumanModeService {
         const prior = this.deps.availability.read(entityId);
         if (!prior.ok) { this.effect(applicationId, "availability", null, null, "failed", `couldn't read the current availability: ${prior.error}`); return; }
         const wrote = this.deps.availability.write(entityId, value);
-        if (wrote.ok) this.effect(applicationId, "availability", { availability: prior.availability ?? null }, { availability: value }, "active", null);
-        else this.effect(applicationId, "availability", { availability: prior.availability ?? null }, null, "failed", wrote.error);
+        // The change identity is the change record the write left (read back right after it) and the value. A write can
+        // also fail after the fragment is saved (re-projecting it fails); the value is then live on the next load, so if
+        // it's now the mode's, the change is still recorded as the mode's own and ending puts the prior value back.
+        const after = this.deps.availability.read(entityId);
+        const landed = after.ok && after.availability === value ? { availability: value, changeId: after.changeId ?? null } : null;
+        const priorValue = { availability: prior.availability ?? null };
+        if (wrote.ok && landed) this.effect(applicationId, "availability", priorValue, landed, "active", null);
+        else this.effect(applicationId, "availability", priorValue, landed, "failed", wrote.ok ? "written, but it didn't read back as written" : wrote.error);
       });
     }
     if (mode.delivery.quiet) {
@@ -221,20 +228,46 @@ export class HumanModeService {
   }
 
   /** End the person's active application: each effect ends only if the latest change is still its own. Returns the
-   *  ended application, or null when none was active. With none active, effects of the latest application still
-   *  `pending` are tried again. */
+   *  ended application, or null when none was active. Every time, restorations still pending or failed from earlier
+   *  applications are tried again (see unresolved), so a later mode never hides an older one's. */
   end(entityId: string, reason: EndReason, actor: string): ModeApplication | null {
     const at = this.now();
-    let row = this.deps.db.prepare(`SELECT * FROM human_mode_applications WHERE entity_id = ? AND ended_at IS NULL`).get(entityId) as ApplicationRow | undefined;
-    if (!row) {
-      const latest = this.deps.db.prepare(`SELECT * FROM human_mode_applications WHERE entity_id = ? ORDER BY started_at DESC LIMIT 1`).get(entityId) as ApplicationRow | undefined;
-      if (!latest || !this.effects(latest.application_id).some((e) => e.state === "pending")) return null;
-      row = latest;
-    } else {
+    const row = this.deps.db.prepare(`SELECT * FROM human_mode_applications WHERE entity_id = ? AND ended_at IS NULL`).get(entityId) as ApplicationRow | undefined;
+    if (row) {
       this.deps.db.prepare(`UPDATE human_mode_applications SET ended_at = ?, ended_by = ?, end_reason = ? WHERE application_id = ?`)
         .run(at.toISOString(), actor, reason, row.application_id);
+      this.endEffects(entityId, row.application_id, actor, at);
     }
-    const applicationId = row.application_id;
+    for (const earlier of this.unresolvedApplicationIds(entityId)) {
+      if (earlier !== row?.application_id) this.endEffects(entityId, earlier, actor, at);
+    }
+    return row ? this.get(row.application_id) : null;
+  }
+
+  /** Restorations from ended applications that are still pending or failed: owed in the coming-back report, and tried
+   *  again by every end. Oldest application first. */
+  unresolved(entityId: string): Array<{ applicationId: string; modeName: string; endedAt: string; effect: ModeEffect }> {
+    const out: Array<{ applicationId: string; modeName: string; endedAt: string; effect: ModeEffect }> = [];
+    for (const id of this.unresolvedApplicationIds(entityId)) {
+      const app = this.get(id)!;
+      for (const effect of app.effects) {
+        if (effect.state === "pending" || (effect.state === "failed" && effect.changeIdentity !== null)) {
+          out.push({ applicationId: id, modeName: app.modeName, endedAt: app.endedAt!, effect });
+        }
+      }
+    }
+    return out;
+  }
+
+  private unresolvedApplicationIds(entityId: string): string[] {
+    return (this.deps.db.prepare(`SELECT DISTINCT a.application_id AS id, a.started_at FROM human_mode_applications a
+        JOIN human_mode_effects e ON e.application_id = a.application_id
+        WHERE a.entity_id = ? AND a.ended_at IS NOT NULL
+          AND (e.state = 'pending' OR (e.state = 'failed' AND e.change_identity IS NOT NULL))
+        ORDER BY a.started_at`).all(entityId) as Array<{ id: string }>).map((r) => r.id);
+  }
+
+  private endEffects(entityId: string, applicationId: string, actor: string, at: Date): void {
     for (const effect of this.effects(applicationId)) {
       if (effect.state === "ended" || effect.state === "kept") continue;
       if (effect.state === "failed" && effect.changeIdentity === null) {
@@ -250,20 +283,24 @@ export class HumanModeService {
         this.effect(applicationId, effect.consumer, effect.prior, effect.changeIdentity, "failed", `couldn't end it: ${(error as Error).message}`);
       }
     }
-    return this.get(applicationId);
   }
 
   private endAvailability(entityId: string, applicationId: string, effect: ModeEffect): void {
-    const wrote = (effect.changeIdentity as { availability: string }).availability;
+    const identity = effect.changeIdentity as { availability: string; changeId?: string | null };
+    const wrote = identity.availability;
     const prior = (effect.prior as { availability: string | null }).availability;
     const now = this.deps.availability.read(entityId);
     if (!now.ok) {
       this.effect(applicationId, "availability", effect.prior, effect.changeIdentity, "pending", `couldn't read the current availability to check it's still this mode's: ${now.error}`);
       return;
     }
-    if (now.availability !== wrote) {
+    // Still the mode's own only if the latest recorded change is the mode's (so away, then focus, then away by hand is
+    // not) and the value is the one it wrote (so a hand edit of the file is not). A record from before change ids
+    // existed falls back to the value alone.
+    const sameChange = identity.changeId == null || now.changeId === identity.changeId;
+    if (now.availability !== wrote || !sameChange) {
       this.effect(applicationId, "availability", effect.prior, effect.changeIdentity, "kept",
-        `changed since the mode started (now ${now.availability ?? "not set"}); that choice stands`);
+        `changed since the mode started (now ${now.availability ?? "not set"}${now.availability === wrote ? ", set again since" : ""}); that choice stands`);
       return;
     }
     const restored = this.deps.availability.write(entityId, (prior ?? "unset") as Availability | "unset");
@@ -282,18 +319,35 @@ export class HumanModeService {
             : "quiet hours were cleared since the mode started; they stay cleared");
         return;
       }
-      // Still the mode's own: put back what was there before it, as it was.
-      let detail: string;
-      if (prior && prior.kind === "daily") {
-        const w = this.quiet.setDaily(entityId, { start: prior.start!, end: prior.end!, timezone: prior.timezone, setBy: actor, now: at, source: prior.source });
-        detail = `restored the daily quiet hours ${prior.start}-${prior.end} ${prior.timezone} (revision ${w.revision})`;
-      } else if (prior && prior.kind === "until" && Date.parse(prior.until!) > at.getTime()) {
-        const w = this.quiet.setUntil(entityId, { until: new Date(prior.until!), timezone: prior.timezone, setBy: actor, now: at, source: prior.source });
-        detail = `restored quiet hours until ${prior.until} (revision ${w.revision})`;
-      } else {
-        const c = this.quiet.clear(entityId, { clearedBy: actor, now: at });
-        detail = prior ? `the quiet hours before it had already run out, so none were restored (revision ${c.revision})` : `cleared the mode's quiet hours (revision ${c.revision})`;
-      }
+      // Still the mode's own rule: put back what was there before it, as it was, in one transaction with any ended mark
+      // carried across, so no reader sees quiet restarted in between. The mark is the person's own "I'm back" for
+      // tonight during the mode (a manual end changes tonight, not the rule), or the prior window's mark for an
+      // occurrence that is still the current one.
+      const personEnded = now.ended ?? null;
+      let detail = "";
+      this.deps.db.transaction(() => {
+        if (prior && prior.kind === "daily") {
+          const w = this.quiet.setDaily(entityId, { start: prior.start!, end: prior.end!, timezone: prior.timezone, setBy: actor, now: at, source: prior.source });
+          detail = `restored the daily quiet hours ${prior.start}-${prior.end} ${prior.timezone} (revision ${w.revision})`;
+        } else if (prior && prior.kind === "until" && Date.parse(prior.until!) > at.getTime()) {
+          const w = this.quiet.setUntil(entityId, { until: new Date(prior.until!), timezone: prior.timezone, setBy: actor, now: at, source: prior.source });
+          detail = `restored quiet hours until ${prior.until} (revision ${w.revision})`;
+        } else {
+          const c = this.quiet.clear(entityId, { clearedBy: actor, now: at });
+          detail = prior ? `the quiet hours before it had already run out, so none were restored (revision ${c.revision})` : `cleared the mode's quiet hours (revision ${c.revision})`;
+          return;
+        }
+        const state = this.quiet.quietStateFor(entityId, at);
+        if (!state.active) return;
+        // Only tonight's mark carries: one for the current occurrence (an until-window has just the one while it lasts),
+        // never one the person left on an earlier night of a daily mode.
+        const tonight = <T extends { occurrence: string }>(ended: T | null | undefined): T | null =>
+          ended && (ended.occurrence === state.occurrence || ended.occurrence === "until") ? ended : null;
+        const mark = tonight(personEnded) ?? (prior?.ended && prior.ended.occurrence === state.occurrence ? prior.ended : null);
+        if (!mark) return;
+        this.quiet.restoreEnded(entityId, state.revision, { occurrence: state.occurrence, by: mark.by, at: mark.at });
+        detail += "; tonight stays off, as you set it";
+      })();
       this.effect(applicationId, "quiet", effect.prior, effect.changeIdentity, "ended", detail);
     } catch (error) {
       this.effect(applicationId, "quiet", effect.prior, effect.changeIdentity, "failed", `couldn't restore quiet hours: ${(error as Error).message}`);

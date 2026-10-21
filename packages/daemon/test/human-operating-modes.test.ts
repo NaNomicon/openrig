@@ -9,7 +9,7 @@ import { join } from "node:path";
 import type Database from "better-sqlite3";
 import { createFullTestDb } from "./helpers/test-app.js";
 import { gatewayRoutes } from "../src/routes/gateway.js";
-import { addHumanFragment, readHumanAvailability, setHumanField } from "../src/domain/gateway/human-registry.js";
+import { addHumanFragment, readHumanAvailability, removeHumanFragment, setHumanField } from "../src/domain/gateway/human-registry.js";
 import { HumanModeService, registryAvailability, type AvailabilityAccess } from "../src/domain/gateway/human-operating-modes.js";
 import { HumanQuietStore } from "../src/domain/gateway/human-quiet-windows.js";
 import { RigModeStore } from "../src/domain/rig-mode/rig-mode-store.js";
@@ -121,6 +121,71 @@ describe("applying and ending a mode", () => {
     expect(f.availability()).toBe("focus");
   });
 
+  it("review F4: an 'I'm back' the person left on an earlier night of a daily mode doesn't switch tonight off", async () => {
+    const f = fixture("2026-10-19T21:00:00Z");
+    f.quiet.setDaily("alex", { start: "20:30", end: "07:00", timezone: "UTC", setBy: "alex", now: f.clock.now });
+    await f.call("PUT", "alex/modes/asleep", { availability: "away", quiet: "20:00-08:00", timezone: "UTC" });
+    await f.call("POST", "alex/modes/asleep/apply", {});
+    expect((await f.call("POST", "alex/quiet/end", {}, "alex")).status).toBe(200); // last night, by hand
+    f.clock.now = new Date("2026-10-20T21:30:00Z"); // the next night
+    const ended = (await f.call("POST", "alex/mode/end", {})).body.ended;
+    expect(stateOf(ended, "quiet")).toBe("ended");
+    expect(ended.effects.find((e: Record<string, any>) => e.consumer === "quiet").detail).not.toMatch(/tonight stays off/);
+    expect(f.quiet.quietStateFor("alex", f.clock.now).active, "tonight's quiet is on, as the restored rule says").toBe(true);
+  });
+
+  it("review F1: away by the mode, then focus and away again by hand: the same value, but a later change of theirs, so kept", async () => {
+    const f = fixture();
+    await f.call("PUT", "alex/modes/away-from-desk", { availability: "away" });
+    await f.call("POST", "alex/modes/away-from-desk/apply", {});
+    expect(setHumanField("alex", "availability", "focus", f.home).ok).toBe(true);
+    expect(setHumanField("alex", "availability", "away", f.home).ok).toBe(true);
+    const ended = (await f.call("POST", "alex/mode/end", {})).body.ended;
+    expect(stateOf(ended, "availability")).toBe("kept");
+    expect(f.availability()).toBe("away");
+  });
+
+  it("review F1: removing a person drops their change record, so a re-add never inherits an old change id", () => {
+    const f = fixture();
+    const before = readHumanAvailability("sam", f.home);
+    expect(before).toMatchObject({ ok: true, changeId: expect.any(String) });
+    expect(removeHumanFragment("sam", { inflight: [] }, f.home).ok).toBe(true);
+    expect(addHumanFragment(person("sam"), f.home).ok).toBe(true);
+    const after = readHumanAvailability("sam", f.home);
+    expect(after).toMatchObject({ ok: true, changeId: expect.any(String) });
+    expect((after as { changeId: string }).changeId).not.toBe((before as { changeId: string }).changeId);
+  });
+
+  it("review F4: a prior occurrence the person had ended before the mode stays ended when the prior rule is restored", async () => {
+    const f = fixture(); // 21:00 UTC
+    f.quiet.setDaily("alex", { start: "20:00", end: "08:00", timezone: "UTC", setBy: "alex", now: f.clock.now });
+    f.quiet.end("alex", { endedBy: "alex", now: f.clock.now }); // "I'm back" for tonight, before any mode
+    await f.call("PUT", "alex/modes/asleep", { availability: "away", quiet: "23:00-06:00", timezone: "UTC" });
+    await f.call("POST", "alex/modes/asleep/apply", {});
+    f.clock.now = new Date("2026-10-20T22:00:00Z");
+    const ended = (await f.call("POST", "alex/mode/end", {})).body.ended;
+    expect(stateOf(ended, "quiet")).toBe("ended");
+    expect(f.quiet.show("alex")).toMatchObject({ kind: "daily", start: "20:00", end: "08:00", source: "manual", ended: { occurrence: "2026-10-20", by: "alex" } });
+    expect(f.quiet.quietStateFor("alex", f.clock.now).active, "tonight doesn't start again").toBe(false);
+  });
+
+  it("review F4: a manual quiet end during the mode carries across: the prior rule is restored, tonight stays off, the mode's window is gone", async () => {
+    const f = fixture(); // 21:00 UTC
+    f.quiet.setDaily("alex", { start: "20:30", end: "07:00", timezone: "UTC", setBy: "alex", now: f.clock.now });
+    await f.call("PUT", "alex/modes/asleep", { availability: "away", quiet: "20:00-08:00", timezone: "UTC" });
+    const app = (await f.call("POST", "alex/modes/asleep/apply", {})).body.application;
+    expect(f.quiet.quietStateFor("alex", f.clock.now).active).toBe(true);
+    expect((await f.call("POST", "alex/quiet/end", {}, "alex")).status).toBe(200); // the person's own "I'm back" for tonight
+    f.clock.now = new Date("2026-10-20T21:30:00Z");
+    const ended = (await f.call("POST", "alex/mode/end", {})).body.ended;
+    const quietEffect = ended.effects.find((e: Record<string, any>) => e.consumer === "quiet");
+    expect(quietEffect).toMatchObject({ state: "ended", detail: expect.stringMatching(/restored the daily quiet hours 20:30-07:00 UTC .*; tonight stays off, as you set it$/) });
+    const window = f.quiet.show("alex")!;
+    expect(window).toMatchObject({ kind: "daily", start: "20:30", end: "07:00", source: "manual", ended: { by: "alex" } });
+    expect(window.source).not.toBe(`mode-application:${app.applicationId}`);
+    expect(f.quiet.quietStateFor("alex", f.clock.now).active, "quiet is off now").toBe(false);
+  });
+
   it("an availability that wasn't authored before the mode is unauthored again after it", async () => {
     const f = fixture();
     await f.call("PUT", "sam/modes/away-from-desk", { availability: "away", timezone: "UTC" });
@@ -212,6 +277,25 @@ describe("effects that fail or can't be checked", () => {
     expect(f.availability()).toBe("available");
   });
 
+  it("review F2: a write that saved the fragment but failed to re-project is still the mode's change, so ending restores it", async () => {
+    const f = fixture();
+    const real = registryAvailability(f.home);
+    let first = true;
+    const modes = service(f, { read: real.read, write: (id, value) => {
+      if (!first) return real.write(id, value);
+      first = false;
+      real.write(id, value); // the fragment is saved ...
+      return { ok: false, error: "fragment written but re-projection failed: disk full (test)" }; // ... and projecting it fails
+    } });
+    modes.save("alex", { name: "out-of-office", availability: { value: "off" } }, "op");
+    const app = modes.apply("alex", "out-of-office", {}, "op").application!;
+    expect(app.effects[0]).toMatchObject({ consumer: "availability", state: "failed", changeIdentity: { availability: "off" }, detail: expect.stringMatching(/re-projection failed/) });
+    expect(f.availability()).toBe("off"); // live on the next load
+    const ended = modes.end("alex", "back", "op")!;
+    expect(ended.effects[0]).toMatchObject({ consumer: "availability", state: "ended" });
+    expect(f.availability()).toBe("available");
+  });
+
   it("a restore that fails is failed, not ended", async () => {
     const f = fixture();
     const real = registryAvailability(f.home);
@@ -236,8 +320,33 @@ describe("effects that fail or can't be checked", () => {
     expect(ended).toMatchObject({ endReason: "back" });
     expect(stateOf(ended, "availability")).toBe("pending");
     expect(modes.current("alex")).toBeNull();
+    expect(modes.unresolved("alex")).toEqual([expect.objectContaining({ applicationId: ended.applicationId, effect: expect.objectContaining({ state: "pending" }) })]);
     readable = true;
-    expect(stateOf(modes.end("alex", "back", "op")!, "availability")).toBe("ended");
+    expect(modes.end("alex", "back", "op")).toBeNull(); // no mode on: the earlier pending restore is tried again
+    expect(stateOf(modes.get(ended.applicationId)!, "availability")).toBe("ended");
+    expect(modes.unresolved("alex")).toEqual([]);
+    expect(f.availability()).toBe("available");
+  });
+
+  it("review F3: an older pending restore stays listed while a later mode is on, and that mode's end retries it", async () => {
+    const f = fixture();
+    const real = registryAvailability(f.home);
+    let readable = true;
+    const modes = service(f, { read: (id) => (readable ? real.read(id) : { ok: false, error: "registry unreadable (test)" }), write: real.write });
+    modes.save("alex", { name: "away-from-desk", availability: { value: "away" } }, "op");
+    modes.save("alex", { name: "asleep", decisionRoom: { words: "the usual", exclusions: [] } }, "op");
+    const first = modes.apply("alex", "away-from-desk", {}, "op").application!;
+    readable = false;
+    modes.end("alex", "back", "op"); // its availability restore is pending
+    const second = modes.apply("alex", "asleep", {}, "op").application; // a switch isn't refused
+    expect(second).not.toBeNull();
+    expect(modes.current("alex")?.applicationId).toBe(second!.applicationId);
+    expect(modes.unresolved("alex")).toEqual([expect.objectContaining({ applicationId: first.applicationId, modeName: "away-from-desk",
+      effect: expect.objectContaining({ consumer: "availability", state: "pending" }) })]);
+    readable = true;
+    modes.end("alex", "back", "op"); // ending the later mode tries the older restore again
+    expect(stateOf(modes.get(first.applicationId)!, "availability")).toBe("ended");
+    expect(modes.unresolved("alex")).toEqual([]);
     expect(f.availability()).toBe("available");
   });
 });

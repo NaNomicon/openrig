@@ -199,16 +199,17 @@ export function gatewayRoutes(opts: {
     const saved = modes.saved(entityId, name);
     const timezone = text(body.timezone) ?? (saved?.delivery.quiet?.timezone || "UTC");
     const result = modes.apply(entityId, name, { scheduledEnd: until ? resolveUntil(until, timezone, at) : null }, actor);
-    return { application: result.application, ended: result.ended, atDesk: result.application === null };
+    return { application: result.application, ended: result.ended, atDesk: result.application === null, unresolved: modes.unresolved(entityId) };
   }));
+  // `unresolved`: restorations from earlier modes still pending or failed, owed in the coming-back report until resolved.
   app.get("/human/:entityId/mode", modeRoute("reading the current mode", ({ modes, entityId }) => {
     const current = modes.current(entityId);
-    return { current, atDesk: current === null };
+    return { current, atDesk: current === null, unresolved: modes.unresolved(entityId) };
   }));
   app.post("/human/:entityId/mode/end", modeRoute("ending a mode", ({ modes, entityId, actor, body }) => {
     const reason = body.reason === "scheduled" ? "scheduled" : "back";
     const ended = modes.end(entityId, reason, actor);
-    return { ended, atDesk: modes.current(entityId) === null };
+    return { ended, atDesk: modes.current(entityId) === null, unresolved: modes.unresolved(entityId) };
   }));
 
   app.post("/slack/:operation", async (c) => {
