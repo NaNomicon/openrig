@@ -33,6 +33,10 @@ export interface OmpBridgeServerOptions {
   onControlFrame: (frame: Record<string, unknown>) => void;
   /** The bridge connected and identified itself. */
   onBridgeReady?: (handshake: OmpBridgeHandshake) => void;
+  /** The bridge connection closed; the seat is no longer reachable through it. */
+  onBridgeClosed?: () => void;
+  /** Deterministic seam for exercising lock replacement after atomic rename. */
+  onLockMovedAside?: (asidePath: string) => void;
   /** Diagnostics for the seat log. */
   onLog?: (line: string) => void;
   /** Deterministic seam for exercising stale-lock replacement races. */
@@ -172,6 +176,7 @@ export class OmpBridgeServer {
           if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
           refuse();
         }
+        this.opts.onLockMovedAside?.(asidePath);
         const asideOwner = readLockOwner(asidePath);
         if (asideOwner === owner) {
           fs.unlinkSync(asidePath);
@@ -179,10 +184,12 @@ export class OmpBridgeServer {
         }
         try {
           fs.linkSync(asidePath, lockPath);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "EEXIST") refuse();
+          try { fs.unlinkSync(asidePath); } catch { /* aside cleanup is best effort */ }
+        } catch {
+          // The moved lock stays on disk: it is a live claim that cannot be put
+          // back, and deleting it would destroy the other owner's claim.
+          refuse();
         }
-        try { fs.unlinkSync(asidePath); } catch { /* aside cleanup is best effort */ }
         refuse();
       }
       try {
@@ -202,23 +209,22 @@ export class OmpBridgeServer {
   private releaseLock(lockPath: string): void {
     if (!this.ownsLock) return;
     this.ownsLock = false;
-    if (readLockOwner(lockPath) !== this.lockOwner) return;
     const asidePath = `${lockPath}.${randomBytes(12).toString("hex")}.aside`;
     try {
       fs.renameSync(lockPath, asidePath);
     } catch { return; }
+    this.opts.onLockMovedAside?.(asidePath);
     if (readLockOwner(asidePath) === this.lockOwner) {
       try { fs.unlinkSync(asidePath); } catch { /* already gone */ }
       return;
     }
     try {
       fs.linkSync(asidePath, lockPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") return;
+      try { fs.unlinkSync(asidePath); } catch { /* aside cleanup is best effort */ }
+    } catch {
+      // Preserve the moved lock rather than delete a claim now at lockPath.
     }
-    try { fs.unlinkSync(asidePath); } catch { /* aside cleanup is best effort */ }
   }
-
 
   /** Stop serving and remove the socket file. */
   close(): void {
@@ -308,6 +314,7 @@ export class OmpBridgeServer {
             if (this.bridgeSocket === socket) {
               this.bridgeSocket = null;
               this.failAwaiting("bridge disconnected before acknowledgement");
+              this.opts.onBridgeClosed?.();
             }
           });
           this.opts.onBridgeReady?.(frame);

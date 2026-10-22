@@ -63,6 +63,22 @@ describe("the runner's native-UI mode", () => {
     expect(mirror.join("\n")).toMatch(/READY/);
   });
 
+  it("clears readiness on bridge disconnect and restores it after reconnect", () => {
+    const { runner, sidecars, mirror } = core({ bridgeUi: true });
+    runner.adoptSessionIdentity({ sessionId: "session-1", sessionFile });
+    expect(runner.isReady()).toBe(true);
+    expect(sidecars.at(-1)).toMatchObject({ ready: true, sessionFile });
+
+    runner.markBridgeDisconnected();
+    expect(runner.isReady()).toBe(false);
+    expect(sidecars.at(-1)).toMatchObject({ ready: false, sessionFile });
+    expect(mirror.join("\n")).toContain("[omp-runner] NOT READY bridge disconnected");
+
+    runner.adoptSessionIdentity({ sessionId: "session-1", sessionFile });
+    expect(runner.isReady()).toBe(true);
+    expect(sidecars.at(-1)).toMatchObject({ ready: true, sessionFile });
+  });
+
   it("waits for the identity instead of stopping the seat when the state reply has none", () => {
     const { runner, rpc, stops, mirror } = core({ bridgeUi: true });
     runner.start();

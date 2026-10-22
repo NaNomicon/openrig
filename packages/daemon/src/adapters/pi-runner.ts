@@ -884,6 +884,13 @@ export class RunnerCore {
     this.postSessionIdentity();
   }
 
+  /** A native OMP seat cannot answer status after its bridge disappears. */
+  markBridgeDisconnected(): void {
+    this.ready = false;
+    this.writeSidecar({});
+    this.io.mirrorLine("[omp-runner] NOT READY bridge disconnected");
+  }
+
   private postSessionIdentity(): void {
     if (this.runtime === "omp" && (!this.sessionFile || !this.io.sessionFileExists?.(this.sessionFile))) return;
     if (this.runtime === "omp" && (this.identityPersisted || this.identityInFlight)) return;
@@ -1282,6 +1289,10 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
           sessionId: typeof handshake.sessionId === "string" ? handshake.sessionId : undefined,
           sessionFile: typeof handshake.sessionFile === "string" ? handshake.sessionFile : undefined,
         });
+      },
+      onBridgeClosed: () => {
+        bridgeUp = false;
+        coreRef?.markBridgeDisconnected();
       },
       onLog: (line) => report(line),
     });

@@ -12,7 +12,7 @@ function createSocketPath(): { directory: string; socketPath: string } {
 
 function createBridgeServer(
   socketPath: string,
-  options: Pick<OmpBridgeServerOptions, "onLockOwnerJudged"> = {},
+  options: Pick<OmpBridgeServerOptions, "onLockOwnerJudged" | "onLockMovedAside" | "onBridgeClosed" | "onBridgeReady"> = {},
 ): OmpBridgeServer {
   return new OmpBridgeServer({
     socketPath,
@@ -109,16 +109,17 @@ describe("OmpBridgeServer socket ownership", () => {
     }
   });
 
-  it("refuses stale takeover when lock is replaced by a live owner", async () => {
+  it("preserves a replacement lock during stale takeover", async () => {
     const { directory, socketPath } = createSocketPath();
     const lockPath = `${socketPath}.lock`;
     let replaced = false;
     const server = createBridgeServer(socketPath, {
-      onLockOwnerJudged: () => {
+      onLockMovedAside: (asidePath) => {
         if (replaced) return;
         replaced = true;
-        fs.unlinkSync(lockPath);
-        fs.writeFileSync(lockPath, `${process.pid}:other-owner`);
+        fs.unlinkSync(asidePath);
+        fs.writeFileSync(asidePath, "replacement-aside-owner");
+        fs.writeFileSync(lockPath, `${process.pid}:replacement-owner`);
       },
     });
     try {
@@ -127,7 +128,33 @@ describe("OmpBridgeServer socket ownership", () => {
         `Another runner already serves socket ${socketPath}`,
       );
       expect(replaced).toBe(true);
-      expect(fs.readFileSync(lockPath, "utf8")).toBe(`${process.pid}:other-owner`);
+      expect(fs.readFileSync(lockPath, "utf8")).toBe(`${process.pid}:replacement-owner`);
+      expect(fs.readdirSync(directory).some((name) => name.endsWith(".aside"))).toBe(true);
+    } finally {
+      server.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a replacement lock during release", async () => {
+    const { directory, socketPath } = createSocketPath();
+    const lockPath = `${socketPath}.lock`;
+    let replaced = false;
+    const server = createBridgeServer(socketPath, {
+      onLockMovedAside: (asidePath) => {
+        if (replaced) return;
+        replaced = true;
+        fs.unlinkSync(asidePath);
+        fs.writeFileSync(asidePath, "replacement-aside-owner");
+        fs.writeFileSync(lockPath, `${process.pid}:replacement-owner`);
+      },
+    });
+    try {
+      await server.start();
+      server.close();
+      expect(replaced).toBe(true);
+      expect(fs.readFileSync(lockPath, "utf8")).toBe(`${process.pid}:replacement-owner`);
+      expect(fs.readdirSync(directory).some((name) => name.endsWith(".aside"))).toBe(true);
     } finally {
       server.close();
       fs.rmSync(directory, { recursive: true, force: true });
@@ -246,4 +273,72 @@ describe("OmpBridgeServer socket ownership", () => {
       fs.rmSync(directory, { recursive: true, force: true });
     }
   });
+
+  it("reports bridge closure once and ignores control-client closure", async () => {
+    const { directory, socketPath } = createSocketPath();
+    let bridgeClosedCount = 0;
+    let bridgeReadyCount = 0;
+    let bridgeReadyResolve: (() => void) | undefined;
+    let bridgeClosedResolve: (() => void) | undefined;
+    let bridgeReady = new Promise<void>((resolve) => { bridgeReadyResolve = resolve; });
+    let bridgeClosed = new Promise<void>((resolve) => { bridgeClosedResolve = resolve; });
+    const server = createBridgeServer(socketPath, {
+      onBridgeReady: () => {
+        bridgeReadyCount += 1;
+        bridgeReadyResolve?.();
+      },
+      onBridgeClosed: () => {
+        bridgeClosedCount += 1;
+        bridgeClosedResolve?.();
+      },
+    });
+    try {
+      await server.start();
+      const control = net.createConnection(socketPath);
+      await new Promise<void>((resolve, reject) => {
+        control.once("connect", () => {
+          control.write(`${JSON.stringify({ role: "control", protocolVersion: 1 })}\n`);
+          resolve();
+        });
+        control.once("error", reject);
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      control.destroy();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(bridgeClosedCount).toBe(0);
+
+      const bridge = net.createConnection(socketPath);
+      await new Promise<void>((resolve, reject) => {
+        bridge.once("connect", () => {
+          bridge.write(`${JSON.stringify({ role: "bridge", protocolVersion: 1 })}\n`);
+          resolve();
+        });
+        bridge.once("error", reject);
+      });
+      await bridgeReady;
+      bridge.destroy();
+      await bridgeClosed;
+      expect(bridgeClosedCount).toBe(1);
+
+      bridgeReady = new Promise<void>((resolve) => { bridgeReadyResolve = resolve; });
+      bridgeClosed = new Promise<void>((resolve) => { bridgeClosedResolve = resolve; });
+      const reconnectedBridge = net.createConnection(socketPath);
+      await new Promise<void>((resolve, reject) => {
+        reconnectedBridge.once("connect", () => {
+          reconnectedBridge.write(`${JSON.stringify({ role: "bridge", protocolVersion: 1 })}\n`);
+          resolve();
+        });
+        reconnectedBridge.once("error", reject);
+      });
+      await bridgeReady;
+      expect(bridgeReadyCount).toBe(2);
+      reconnectedBridge.destroy();
+      await bridgeClosed;
+      expect(bridgeClosedCount).toBe(2);
+    } finally {
+      server.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
 });
