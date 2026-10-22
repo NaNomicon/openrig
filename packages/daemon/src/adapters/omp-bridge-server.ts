@@ -35,6 +35,8 @@ export interface OmpBridgeServerOptions {
   onBridgeReady?: (handshake: OmpBridgeHandshake) => void;
   /** The bridge connection closed; the seat is no longer reachable through it. */
   onBridgeClosed?: () => void;
+  /** Process signal probe seam for deterministic lock-owner checks. */
+  processKill?: (pid: number, signal: 0) => boolean;
   /** Deterministic seam for exercising lock replacement after atomic rename. */
   onLockMovedAside?: (asidePath: string) => void;
   /** Diagnostics for the seat log. */
@@ -64,13 +66,13 @@ function isSocketServing(socketPath: string): Promise<boolean> {
   });
 }
 
-/** Whether a process is still running. A pid we may not signal is alive. */
-function isProcessAlive(pid: number): boolean {
+/** Whether a process is still running. Only ESRCH proves that it is dead. */
+function isProcessAlive(pid: number, processKill: (pid: number, signal: 0) => boolean): boolean {
   try {
-    process.kill(pid, 0);
+    processKill(pid, 0);
     return true;
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
 }
 
@@ -167,7 +169,8 @@ export class OmpBridgeServer {
         const pidText = owner.split(":", 1)[0];
         const pid = Number(pidText);
         // A pid outside the operating system's range cannot be running.
-        const owned = Number.isSafeInteger(pid) && pid > 0 && pid <= 0x7fffffff && isProcessAlive(pid);
+        const owned = Number.isSafeInteger(pid) && pid > 0 && pid <= 0x7fffffff
+          && isProcessAlive(pid, this.opts.processKill ?? process.kill);
         if (owned) refuse();
         const asidePath = `${lockPath}.${randomBytes(12).toString("hex")}.aside`;
         try {

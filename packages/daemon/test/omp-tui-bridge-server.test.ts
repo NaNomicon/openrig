@@ -12,7 +12,7 @@ function createSocketPath(): { directory: string; socketPath: string } {
 
 function createBridgeServer(
   socketPath: string,
-  options: Pick<OmpBridgeServerOptions, "onLockOwnerJudged" | "onLockMovedAside" | "onBridgeClosed" | "onBridgeReady"> = {},
+  options: Pick<OmpBridgeServerOptions, "onLockOwnerJudged" | "onLockMovedAside" | "onBridgeClosed" | "onBridgeReady" | "processKill"> = {},
 ): OmpBridgeServer {
   return new OmpBridgeServer({
     socketPath,
@@ -201,6 +201,49 @@ describe("OmpBridgeServer socket ownership", () => {
         `Another runner already serves socket ${socketPath}`,
       );
       expect(fs.readFileSync(lockPath, "utf8")).toBe(owner);
+    } finally {
+      server.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["EPERM", Object.assign(new Error("permission denied"), { code: "EPERM" })],
+    ["unexpected errors", new Error("unexpected process probe failure")],
+  ])("preserves a pid lock on %s from process probe", async (_failure, error) => {
+    const { directory, socketPath } = createSocketPath();
+    const owner = "12345:live-owner";
+    const server = createBridgeServer(socketPath, {
+      processKill: () => {
+        throw error;
+      },
+    });
+    const lockPath = `${socketPath}.lock`;
+    try {
+      fs.writeFileSync(lockPath, owner);
+      await expect(server.start()).rejects.toThrow(
+        `Another runner already serves socket ${socketPath}`,
+      );
+      expect(fs.readFileSync(lockPath, "utf8")).toBe(owner);
+    } finally {
+      server.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("takes over a pid lock when process probe returns ESRCH", async () => {
+    const { directory, socketPath } = createSocketPath();
+    const lockPath = `${socketPath}.lock`;
+    const server = createBridgeServer(socketPath, {
+      processKill: () => {
+        throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+      },
+    });
+    try {
+      fs.writeFileSync(lockPath, "12345:gone-owner");
+      await server.start();
+      await connect(socketPath);
+      expect(fs.readFileSync(lockPath, "utf8")).toMatch(new RegExp(`^${process.pid}:`));
     } finally {
       server.close();
       fs.rmSync(directory, { recursive: true, force: true });
