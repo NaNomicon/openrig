@@ -24,7 +24,7 @@ import {
 } from "./omp-bridge-protocol.js";
 
 const MAX_ENUMERATED_ENTRIES = 1000;
-const MAX_CURSOR_WALK_STEPS = 100000;
+const MAX_CURSOR_WALK_STEPS = 1000;
 const RECONNECT_INITIAL_DELAY_MS = 250;
 const RECONNECT_MAX_DELAY_MS = 5000;
 
@@ -280,10 +280,12 @@ export class OmpTuiBridge {
    * leaf's parent chain: the chain is the session's current branch, so the
    * ids below the cursor are exactly the ones the cursor has not seen.
    *
-   * A cursor off that chain cannot identify a safe suffix, and a range longer
-   * than the reply budget cannot be carried whole. Both replies stay
-   * truncated, and both keep the omitted entries recoverable: the caller
-   * keeps its cursor behind them and asks again.
+   * A cursor off that chain or beyond the walk budget cannot identify a safe
+   * suffix and returns an empty truncated reply with the cursor unchanged. A
+   * range longer than the reply budget keeps omitted entries recoverable: the
+   * caller advances through enumerated entries and asks again. Cursor walks
+   * are bounded to 1000 parent lookups; a cursor more than 1000 entries behind
+   * the leaf remains unserved until the cursor or session identity is reset.
    */
   private entries(since?: string): OmpBridgeEntriesReply {
     const manager = this.ctx?.sessionManager;
@@ -352,8 +354,12 @@ export class OmpTuiBridge {
       steps += 1;
       currentId = parentOf(currentId);
     }
+    // The last permitted lookup can land directly on the cursor; recognize it
+    // without spending an extra parent lookup.
+    if (!anchored && currentId === since) anchored = true;
     if (!anchored) {
-      // The cursor is not safely reachable; keep it so omitted entries remain recoverable.
+      // The cursor is not safely reachable within the bounded walk; keep it so
+      // omitted entries remain recoverable.
       return { entries: [], truncated: true, available: true, newestId };
     }
     const ids: string[] = [];
