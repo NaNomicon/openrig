@@ -3,18 +3,22 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import nodePath from "node:path";
-import { OmpBridgeServer } from "../src/adapters/omp-bridge-server.js";
+import { OmpBridgeServer, type OmpBridgeServerOptions } from "../src/adapters/omp-bridge-server.js";
 
 function createSocketPath(): { directory: string; socketPath: string } {
   const directory = fs.mkdtempSync(nodePath.join(os.tmpdir(), "openrig-omp-bridge-server-"));
   return { directory, socketPath: nodePath.join(directory, "bridge.sock") };
 }
 
-function createBridgeServer(socketPath: string): OmpBridgeServer {
+function createBridgeServer(
+  socketPath: string,
+  options: Pick<OmpBridgeServerOptions, "onLockOwnerJudged"> = {},
+): OmpBridgeServer {
   return new OmpBridgeServer({
     socketPath,
     onBridgeFrame: () => {},
     onControlFrame: () => {},
+    ...options,
   });
 }
 
@@ -88,6 +92,93 @@ describe("OmpBridgeServer socket ownership", () => {
       fs.rmSync(directory, { recursive: true, force: true });
     }
   });
+  it("takes over a stale pid lock and records its tokenized owner", async () => {
+    const { directory, socketPath } = createSocketPath();
+    const server = createBridgeServer(socketPath);
+    const lockPath = `${socketPath}.lock`;
+    try {
+      fs.writeFileSync(lockPath, String(deadPid()));
+      await server.start();
+      await connect(socketPath);
+      const owner = fs.readFileSync(lockPath, "utf8");
+      expect(owner).toMatch(new RegExp(`^${process.pid}:`));
+      expect(owner.slice(`${process.pid}:`.length)).not.toBe("");
+    } finally {
+      server.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses stale takeover when lock is replaced by a live owner", async () => {
+    const { directory, socketPath } = createSocketPath();
+    const lockPath = `${socketPath}.lock`;
+    let replaced = false;
+    const server = createBridgeServer(socketPath, {
+      onLockOwnerJudged: () => {
+        if (replaced) return;
+        replaced = true;
+        fs.unlinkSync(lockPath);
+        fs.writeFileSync(lockPath, `${process.pid}:other-owner`);
+      },
+    });
+    try {
+      fs.writeFileSync(lockPath, String(deadPid()));
+      await expect(server.start()).rejects.toThrow(
+        `Another runner already serves socket ${socketPath}`,
+      );
+      expect(replaced).toBe(true);
+      expect(fs.readFileSync(lockPath, "utf8")).toBe(`${process.pid}:other-owner`);
+    } finally {
+      server.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a replacement lock when closing", async () => {
+    const { directory, socketPath } = createSocketPath();
+    const server = createBridgeServer(socketPath);
+    const lockPath = `${socketPath}.lock`;
+    try {
+      await server.start();
+      fs.writeFileSync(lockPath, `${process.pid}:other-owner`);
+      server.close();
+      expect(fs.readFileSync(lockPath, "utf8")).toBe(`${process.pid}:other-owner`);
+    } finally {
+      server.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("records a pid and non-empty token in its lock", async () => {
+    const { directory, socketPath } = createSocketPath();
+    const server = createBridgeServer(socketPath);
+    try {
+      await server.start();
+      const owner = fs.readFileSync(`${socketPath}.lock`, "utf8");
+      expect(owner).toMatch(new RegExp(`^${process.pid}:`));
+      expect(owner.slice(`${process.pid}:`.length)).not.toBe("");
+    } finally {
+      server.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a live pid lock without removing it", async () => {
+    const { directory, socketPath } = createSocketPath();
+    const server = createBridgeServer(socketPath);
+    const lockPath = `${socketPath}.lock`;
+    const owner = `${process.pid}:live-owner`;
+    try {
+      fs.writeFileSync(lockPath, owner);
+      await expect(server.start()).rejects.toThrow(
+        `Another runner already serves socket ${socketPath}`,
+      );
+      expect(fs.readFileSync(lockPath, "utf8")).toBe(owner);
+    } finally {
+      server.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
 
   it("takes over a lock file whose owner is gone", async () => {
     const { directory, socketPath } = createSocketPath();
@@ -97,7 +188,9 @@ describe("OmpBridgeServer socket ownership", () => {
       fs.writeFileSync(lockPath, String(deadPid()));
       await server.start();
       await connect(socketPath);
-      expect(fs.readFileSync(lockPath, "utf8").trim()).toBe(String(process.pid));
+      const owner = fs.readFileSync(lockPath, "utf8");
+      expect(owner).toMatch(new RegExp(`^${process.pid}:`));
+      expect(owner.slice(`${process.pid}:`.length)).not.toBe("");
     } finally {
       server.close();
       fs.rmSync(directory, { recursive: true, force: true });

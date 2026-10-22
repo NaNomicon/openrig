@@ -13,6 +13,7 @@
 // used, so activity, session identity and the readiness sidecar keep working
 // unchanged.
 
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import {
@@ -34,6 +35,8 @@ export interface OmpBridgeServerOptions {
   onBridgeReady?: (handshake: OmpBridgeHandshake) => void;
   /** Diagnostics for the seat log. */
   onLog?: (line: string) => void;
+  /** Deterministic seam for exercising stale-lock replacement races. */
+  onLockOwnerJudged?: (owner: string) => void;
 }
 
 /** Commands queued for the bridge while it has not connected yet. */
@@ -67,10 +70,10 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-/** The pid recorded in a lock file, or null when the file cannot be read. */
+/** The exact content recorded in a lock file, or null when it cannot be read. */
 function readLockOwner(lockPath: string): string | null {
   try {
-    return fs.readFileSync(lockPath, "utf8").trim();
+    return fs.readFileSync(lockPath, "utf8");
   } catch {
     return null;
   }
@@ -86,6 +89,7 @@ export class OmpBridgeServer {
   private readonly awaiting = new Map<string, net.Socket>();
   private activeControlSocket: net.Socket | null = null;
   private ownsLock = false;
+  private readonly lockOwner = `${process.pid}:${randomBytes(12).toString("hex")}`;
 
   constructor(private readonly opts: OmpBridgeServerOptions) {}
 
@@ -144,7 +148,7 @@ export class OmpBridgeServer {
     const refuse: () => never = () => {
       throw new Error(`Another runner already serves socket ${this.opts.socketPath}`);
     };
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
       let descriptor: number;
       try {
         descriptor = fs.openSync(lockPath, "wx");
@@ -155,19 +159,34 @@ export class OmpBridgeServer {
         }
         const owner = readLockOwner(lockPath);
         if (owner === null) refuse();
-        const pid = Number(owner);
+        this.opts.onLockOwnerJudged?.(owner);
+        const pidText = owner.split(":", 1)[0];
+        const pid = Number(pidText);
         // A pid outside the operating system's range cannot be running.
         const owned = Number.isSafeInteger(pid) && pid > 0 && pid <= 0x7fffffff && isProcessAlive(pid);
         if (owned) refuse();
+        const asidePath = `${lockPath}.${randomBytes(12).toString("hex")}.aside`;
         try {
-          fs.unlinkSync(lockPath);
-        } catch {
+          fs.renameSync(lockPath, asidePath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
           refuse();
         }
-        continue;
+        const asideOwner = readLockOwner(asidePath);
+        if (asideOwner === owner) {
+          fs.unlinkSync(asidePath);
+          continue;
+        }
+        try {
+          fs.linkSync(asidePath, lockPath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") refuse();
+        }
+        try { fs.unlinkSync(asidePath); } catch { /* aside cleanup is best effort */ }
+        refuse();
       }
       try {
-        fs.writeFileSync(descriptor, String(process.pid));
+        fs.writeFileSync(descriptor, this.lockOwner);
       } catch (error) {
         fs.closeSync(descriptor);
         try { fs.unlinkSync(lockPath); } catch { /* lock cleanup is best effort */ }
@@ -183,25 +202,39 @@ export class OmpBridgeServer {
   private releaseLock(lockPath: string): void {
     if (!this.ownsLock) return;
     this.ownsLock = false;
+    if (readLockOwner(lockPath) !== this.lockOwner) return;
+    const asidePath = `${lockPath}.${randomBytes(12).toString("hex")}.aside`;
     try {
-      fs.rmSync(lockPath, { force: true });
-    } catch { /* already gone */ }
+      fs.renameSync(lockPath, asidePath);
+    } catch { return; }
+    if (readLockOwner(asidePath) === this.lockOwner) {
+      try { fs.unlinkSync(asidePath); } catch { /* already gone */ }
+      return;
+    }
+    try {
+      fs.linkSync(asidePath, lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") return;
+    }
+    try { fs.unlinkSync(asidePath); } catch { /* aside cleanup is best effort */ }
   }
+
 
   /** Stop serving and remove the socket file. */
   close(): void {
-    const ownedSocket = this.ownsLock;
+    const lockPath = `${this.opts.socketPath}.lock`;
+    const ownsSocket = this.ownsLock && readLockOwner(lockPath) === this.lockOwner;
     this.failAwaiting("bridge server closed");
     this.bridgeSocket?.end();
     this.bridgeSocket = null;
     this.server?.close();
     this.server = null;
-    if (ownedSocket) {
+    if (ownsSocket) {
       try {
         fs.rmSync(this.opts.socketPath, { force: true });
       } catch { /* already gone */ }
     }
-    this.releaseLock(`${this.opts.socketPath}.lock`);
+    this.releaseLock(lockPath);
   }
 
   /**
