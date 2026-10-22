@@ -25,6 +25,8 @@ import {
 
 const MAX_ENUMERATED_ENTRIES = 1000;
 const MAX_CURSOR_WALK_STEPS = 100000;
+const RECONNECT_INITIAL_DELAY_MS = 250;
+const RECONNECT_MAX_DELAY_MS = 5000;
 
 /** OMP session events the runner projects onto the seat's activity feed. */
 const FORWARDED_EVENTS = [
@@ -88,6 +90,9 @@ export function bridgeSocketPath(): string | null {
 export class OmpTuiBridge {
   private socket: net.Socket | null = null;
   private connected = false;
+  private closed = false;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectDelayMs = RECONNECT_INITIAL_DELAY_MS;
   private readonly seenEvents = new Set<string>();
   private ctx: BridgeContext | null = null;
   private sessionId: string | undefined;
@@ -98,16 +103,15 @@ export class OmpTuiBridge {
     private readonly socketPath: string,
   ) {}
 
-  /** Connect, handshake, and start reporting. Resolves once connected. */
+  /** Connect, handshake, and start reporting. */
   async start(): Promise<void> {
-    await this.connect();
     this.registerEventHandlers();
-    const decoder = createBridgeFrameDecoder((frame) => {
-      void this.applyCommand(frame);
-    }, () => this.socket?.destroy());
-    this.socket?.on("data", (chunk: Buffer) => {
-      decoder.push(chunk.toString("utf8"));
-    });
+    try {
+      await this.connect();
+    } catch (error) {
+      this.scheduleReconnect();
+      throw error;
+    }
   }
 
   /** Whether the runner connection is up. */
@@ -125,9 +129,12 @@ export class OmpTuiBridge {
     return this.sessionFile;
   }
 
-  /** Close the runner connection. */
+  /** Close the runner connection and prevent further reconnects. */
   close(): void {
+    this.closed = true;
     this.connected = false;
+    clearTimeout(this.reconnectTimer ?? undefined);
+    this.reconnectTimer = null;
     this.socket?.end();
     this.socket = null;
   }
@@ -144,11 +151,20 @@ export class OmpTuiBridge {
         socket.off("error", onError);
         this.socket = socket;
         this.connected = true;
+        this.reconnectDelayMs = RECONNECT_INITIAL_DELAY_MS;
+        const decoder = createBridgeFrameDecoder((frame) => {
+          void this.applyCommand(frame);
+        }, () => socket.destroy());
+        socket.on("data", (chunk: Buffer) => {
+          decoder.push(chunk.toString("utf8"));
+        });
         socket.on("error", () => {
           this.connected = false;
         });
         socket.on("close", () => {
           this.connected = false;
+          if (this.socket === socket) this.socket = null;
+          this.scheduleReconnect();
         });
         resolve();
       });
@@ -160,6 +176,21 @@ export class OmpTuiBridge {
       sessionId: this.sessionId,
       sessionFile: this.sessionFile,
     });
+  }
+
+  private scheduleReconnect(): void {
+    if (this.closed || this.reconnectTimer) return;
+    const delay = this.reconnectDelayMs;
+    this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, RECONNECT_MAX_DELAY_MS);
+    const timer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.closed) return;
+      void this.connect().catch(() => {
+        this.scheduleReconnect();
+      });
+    }, delay);
+    timer.unref();
+    this.reconnectTimer = timer;
   }
 
   private captureSessionIdentity(): void {
@@ -360,13 +391,14 @@ export class OmpTuiBridge {
 export default async function activate(pi: BridgeApi): Promise<void> {
   const path = bridgeSocketPath();
   if (!path) return;
+  const bridge = new OmpTuiBridge(pi, path);
+  process.on("exit", () => {
+    bridge.close();
+  });
   try {
-    const bridge = new OmpTuiBridge(pi, path);
     await bridge.start();
-    process.on("exit", () => {
-      bridge.close();
-    });
-  } catch {
-    // No runner channel: the seat still runs, it just reports nothing.
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`[openrig omp bridge] failed to connect to ${path}: ${detail}\n`);
   }
 }

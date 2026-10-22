@@ -5,7 +5,7 @@ import os from "node:os";
 import nodePath from "node:path";
 import { MAX_BRIDGE_FRAME_BYTES, OMP_BRIDGE_COMMAND_TYPES, OMP_BRIDGE_PROTOCOL_VERSION, createBridgeFrameDecoder, parseBridgeCommand } from "../src/adapters/omp-bridge-protocol.js";
 import { OmpBridgeServer } from "../src/adapters/omp-bridge-server.js";
-import { OmpTuiBridge, type BridgeApi, type BridgeContext } from "../src/adapters/omp-tui-extension.js";
+import activate, { OmpTuiBridge, type BridgeApi, type BridgeContext } from "../src/adapters/omp-tui-extension.js";
 
 /** A short socket path inside a fresh temp dir (Unix sockets cap at 108 chars). */
 function tempSocketPath(name: string): string {
@@ -550,5 +550,55 @@ describe("the bridge bounds what it answers and refuses what it does not declare
     expect(reply.data).toEqual({ entries: [], truncated: true, available: true, newestId: "entry-100001" });
     bridge.close();
     server.close();
+  });
+
+  it("reports unexpected activation failures but stays silent without a socket path", async () => {
+    const previousPath = process.env.OPENRIG_OMP_BRIDGE_SOCKET;
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      delete process.env.OPENRIG_OMP_BRIDGE_SOCKET;
+      await activate(fakeExtensionApi().api);
+      expect(stderr).not.toHaveBeenCalled();
+      process.env.OPENRIG_OMP_BRIDGE_SOCKET = tempSocketPath("activation-failure");
+      await activate(fakeExtensionApi().api);
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining("failed to connect to"));
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining("activation-failure.sock"));
+    } finally {
+      if (previousPath === undefined) delete process.env.OPENRIG_OMP_BRIDGE_SOCKET;
+      else process.env.OPENRIG_OMP_BRIDGE_SOCKET = previousPath;
+      stderr.mockRestore();
+    }
+  });
+
+  it("reconnects after socket close and sends a fresh handshake", async () => {
+    const socketPath = tempSocketPath("reconnect");
+    const bridgeFrames = new FrameCollector();
+    const makeServer = (): OmpBridgeServer => new OmpBridgeServer({
+      socketPath, onBridgeFrame: (frame) => bridgeFrames.add(frame), onControlFrame: () => {},
+    });
+    let server = makeServer();
+    await server.start();
+    const { api } = fakeExtensionApi();
+    const bridge = new OmpTuiBridge(api, socketPath);
+    await bridge.start();
+    const bridgeSocket = (bridge as unknown as { socket: net.Socket | null }).socket;
+    if (!bridgeSocket) throw new Error("bridge socket did not connect");
+    try {
+      server.sendToBridge({ type: "get_state", id: "before-close" });
+      await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "before-close");
+      vi.useFakeTimers();
+      server.close();
+      await new Promise<void>((resolve) => bridgeSocket.once("close", resolve));
+      server = makeServer();
+      await server.start();
+      server.sendToBridge({ type: "get_state", id: "after-reconnect" });
+      await vi.advanceTimersByTimeAsync(250);
+      const response = await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "after-reconnect");
+      expect(response.type).toBe("response");
+    } finally {
+      bridge.close();
+      server.close();
+      vi.useRealTimers();
+    }
   });
 });
