@@ -44,18 +44,12 @@ const FORWARDED_EVENTS = [
   "tool_approval_resolved",
 ] as const;
 
-/**
- * Maximum session entries one get_entries reply carries. The runner only
- * needs the newest ids (it advances its catch-up cursor to the last one), so
- * a long session is answered with its tail instead of an unbounded frame.
- */
-const MAX_BRIDGE_ENTRIES = 500;
 
 /** The slice of OMP's session manager this extension reads. */
 export interface BridgeSessionManager {
   getSessionId(): string;
   getSessionFile(): string | undefined;
-  getEntries?(): unknown[];
+  getLeafId?: () => string | null;
 }
 
 /** The slice of OMP's extension context this extension uses. */
@@ -80,12 +74,6 @@ export function bridgeSocketPath(): string | null {
   return value && value.trim() ? value.trim() : null;
 }
 
-/** Extract a session-entry id from a session manager entry. */
-function entryId(entry: unknown): string | null {
-  if (typeof entry !== "object" || entry === null) return null;
-  const id = (entry as Record<string, unknown>).id;
-  return typeof id === "string" && id ? id : null;
-}
 
 /**
  * The bridge's whole job: connect to the runner, report events, apply
@@ -252,10 +240,9 @@ export class OmpTuiBridge {
   }
 
   /**
-   * Each request examines at most MAX_BRIDGE_ENTRIES + 1 entries and keeps
-   * at most MAX_BRIDGE_ENTRIES ids. OMP's sessionManager.getEntries() returns
-   * a copy of the whole entry list; the extension API exposes no bounded
-   * accessor, so the bridge cannot bound that retrieval.
+   * This reply comes from one constant-time lookup; the session's entry list
+   * is never copied. It cannot enumerate entries between the caller's cursor
+   * and the newest entry, which is what `truncated` reports.
    */
   private entries(since?: string): {
     entries: Array<{ id: string }>;
@@ -263,37 +250,21 @@ export class OmpTuiBridge {
     available: boolean;
   } {
     const manager = this.ctx?.sessionManager;
-    if (!manager || typeof manager.getEntries !== "function") {
+    if (!manager || typeof manager.getLeafId !== "function") {
       return { entries: [], truncated: false, available: false };
     }
-    const all = manager.getEntries();
-    if (!Array.isArray(all)) return { entries: [], truncated: false, available: false };
-    if (all.length === 0) return { entries: [], truncated: false, available: true };
-
-    const ids: string[] = [];
-    let cursorFound = since === undefined;
-    let truncated = false;
-    for (let index = all.length - 1; index >= 0; index--) {
-      const id = entryId(all[index]);
-      if (!id) continue;
-      if (!cursorFound) {
-        if (id === since) {
-          cursorFound = true;
-          break;
-        }
-        ids.push(id);
-      } else {
-        ids.push(id);
-      }
-      if (ids.length > MAX_BRIDGE_ENTRIES) {
-        ids.pop();
-        truncated = true;
-        break;
-      }
+    const newestId = manager.getLeafId();
+    if (newestId === null || newestId === "") {
+      return { entries: [], truncated: false, available: true };
     }
-    if (since !== undefined && !cursorFound) truncated = true;
-    ids.reverse();
-    return { entries: ids.map((id) => ({ id })), truncated, available: true };
+    if (since === newestId) {
+      return { entries: [], truncated: false, available: true };
+    }
+    return {
+      entries: [{ id: newestId }],
+      truncated: since !== undefined,
+      available: true,
+    };
   }
 
 
