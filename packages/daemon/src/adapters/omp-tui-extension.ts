@@ -24,6 +24,7 @@ import {
 } from "./omp-bridge-protocol.js";
 
 const MAX_ENUMERATED_ENTRIES = 1000;
+const MAX_CURSOR_WALK_STEPS = 100000;
 
 /** OMP session events the runner projects onto the seat's activity feed. */
 const FORWARDED_EVENTS = [
@@ -269,18 +270,21 @@ export class OmpTuiBridge {
       return { entries: [], truncated: true, available: true, newestId };
     }
 
-    const parentOf = (id: string): string | null => {
-      const parentId = manager.getEntry?.(id)?.parentId;
-      return typeof parentId === "string" && parentId.length > 0 ? parentId : null;
+    const parentOf = (id: string): string | null | undefined => {
+      const entry = manager.getEntry?.(id);
+      if (!entry) return undefined;
+      return typeof entry.parentId === "string" && entry.parentId.length > 0 ? entry.parentId : null;
     };
+
+    // The session is mutable, so a missing entry is a hole in the chain, not its end.
 
     if (since === undefined) {
       // No cursor yet: the caller wants the session's position, so the newest
       // ids are the answer. The ids left out are older than the cursor this
       // reply establishes, not a gap behind it.
       const newest: string[] = [];
-      let currentId: string | null = newestId;
-      while (currentId !== null && newest.length < MAX_ENUMERATED_ENTRIES) {
+      let currentId: string | null | undefined = newestId;
+      while (currentId !== null && currentId !== undefined && newest.length < MAX_ENUMERATED_ENTRIES) {
         newest.push(currentId);
         currentId = parentOf(currentId);
       }
@@ -302,9 +306,10 @@ export class OmpTuiBridge {
     let kept = 0;
     let next = 0;
     let rangeLength = 0;
-    let currentId: string | null = newestId;
+    let currentId: string | null | undefined = newestId;
     let anchored = false;
-    while (currentId !== null) {
+    let steps = 0;
+    while (currentId !== null && currentId !== undefined && steps < MAX_CURSOR_WALK_STEPS) {
       if (currentId === since) {
         anchored = true;
         break;
@@ -313,11 +318,11 @@ export class OmpTuiBridge {
       next = (next + 1) % MAX_ENUMERATED_ENTRIES;
       kept = Math.min(kept + 1, MAX_ENUMERATED_ENTRIES);
       rangeLength += 1;
+      steps += 1;
       currentId = parentOf(currentId);
     }
     if (!anchored) {
-      // The cursor is not on the leaf's path: no safe suffix exists, so the
-      // reply carries nothing and the caller's cursor stays where it is.
+      // The cursor is not safely reachable; keep it so omitted entries remain recoverable.
       return { entries: [], truncated: true, available: true, newestId };
     }
     const ids: string[] = [];

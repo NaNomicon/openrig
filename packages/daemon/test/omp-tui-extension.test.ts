@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -492,6 +492,62 @@ describe("the bridge bounds what it answers and refuses what it does not declare
       .toHaveLength(0);
     expect(messages).toEqual([{ content: "delivered", deliverAs: undefined }]);
 
+    bridge.close();
+    server.close();
+  });
+
+  it("treats a missing ancestor as an unknown end for initial and cursor walks", async () => {
+    const socketPath = tempSocketPath("entries-hole");
+    const bridgeFrames = new FrameCollector();
+    const server = new OmpBridgeServer({ socketPath, onBridgeFrame: (frame) => bridgeFrames.add(frame), onControlFrame: () => {} });
+    await server.start();
+    const { api, handlers } = fakeExtensionApi();
+    const bridge = new OmpTuiBridge(api, socketPath);
+    await bridge.start();
+    handlers.get("agent_start")?.({ type: "agent_start" }, {
+      sessionManager: {
+        getSessionId: () => "session-1", getSessionFile: () => undefined,
+        getLeafId: () => "entry-3",
+        getEntry: (id) => id === "entry-3" ? { id, parentId: "entry-2" } : id === "entry-1" ? { id, parentId: null } : undefined,
+      },
+    });
+    const writes = vi.spyOn(bridge, "write");
+    await bridge.applyCommand({ type: "get_entries", id: "hole-initial" });
+    expect(writes.mock.calls[0]?.[0]).toMatchObject({
+      type: "response", id: "hole-initial", data: { truncated: true, available: true },
+    });
+    await bridge.applyCommand({ type: "get_entries", id: "hole-cursor", since: "entry-1" });
+    expect(writes.mock.calls[2]?.[0]).toEqual({
+      type: "response", id: "hole-cursor",
+      success: true,
+      data: { entries: [], truncated: true, available: true, newestId: "entry-3" },
+    });
+    bridge.close();
+    server.close();
+  });
+
+  it("bounds cursor ancestry work at the hard walk cap", async () => {
+    const socketPath = tempSocketPath("entries-walk-cap");
+    const bridgeFrames = new FrameCollector();
+    const server = new OmpBridgeServer({ socketPath, onBridgeFrame: (frame) => bridgeFrames.add(frame), onControlFrame: () => {} });
+    await server.start();
+    const { api, handlers } = fakeExtensionApi();
+    const bridge = new OmpTuiBridge(api, socketPath);
+    await bridge.start();
+    const entries = new Map<string, string | null>();
+    for (let index = 0; index <= 100001; index += 1) {
+      entries.set(`entry-${index}`, index === 0 ? null : `entry-${index - 1}`);
+    }
+    handlers.get("agent_start")?.({ type: "agent_start" }, {
+      sessionManager: {
+        getSessionId: () => "session-1", getSessionFile: () => undefined,
+        getLeafId: () => "entry-100001",
+        getEntry: (id) => entries.has(id) ? { id, parentId: entries.get(id) } : undefined,
+      },
+    });
+    server.sendToBridge({ type: "get_entries", id: "walk-cap", since: "not-in-chain" });
+    const reply = await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "walk-cap");
+    expect(reply.data).toEqual({ entries: [], truncated: true, available: true, newestId: "entry-100001" });
     bridge.close();
     server.close();
   });
