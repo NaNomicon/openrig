@@ -57,6 +57,25 @@ function isSocketServing(socketPath: string): Promise<boolean> {
   });
 }
 
+/** Whether a process is still running. A pid we may not signal is alive. */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** The pid recorded in a lock file, or null when the file cannot be read. */
+function readLockOwner(lockPath: string): string | null {
+  try {
+    return fs.readFileSync(lockPath, "utf8").trim();
+  } catch {
+    return null;
+  }
+}
+
 /**
  * The bridge socket server. One instance per seat, owned by the runner.
  */
@@ -66,6 +85,7 @@ export class OmpBridgeServer {
   private readonly pending: Array<{ payload: string; control?: net.Socket; id?: string }> = [];
   private readonly awaiting = new Map<string, net.Socket>();
   private activeControlSocket: net.Socket | null = null;
+  private ownsLock = false;
 
   constructor(private readonly opts: OmpBridgeServerOptions) {}
 
@@ -84,43 +104,104 @@ export class OmpBridgeServer {
    * a socket that another live runner still serves is refused, not taken over.
    */
   async start(): Promise<void> {
-    if (await isSocketServing(this.opts.socketPath)) {
-      throw new Error(`Another runner already serves socket ${this.opts.socketPath}`);
+    const lockPath = `${this.opts.socketPath}.lock`;
+    this.claimLock(lockPath);
+    try {
+      if (await isSocketServing(this.opts.socketPath)) {
+        throw new Error(`Another runner already serves socket ${this.opts.socketPath}`);
+      }
+      const server = net.createServer((socket) => this.accept(socket));
+      this.server = server;
+      try {
+        fs.rmSync(this.opts.socketPath, { force: true });
+      } catch { /* a stale socket that cannot be removed fails the listen below */ }
+      await new Promise<void>((resolve, reject) => {
+        const onError = (error: Error): void => {
+          server.removeListener("listening", onListening);
+          reject(error);
+        };
+        const onListening = (): void => {
+          server.off("error", onError);
+          resolve();
+        };
+        server.once("error", onError);
+        server.once("listening", onListening);
+        server.listen(this.opts.socketPath);
+      });
+      // The socket carries seat traffic: keep it owner-only.
+      try {
+        fs.chmodSync(this.opts.socketPath, 0o600);
+      } catch { /* best effort — the seat directory already restricts access */ }
+    } catch (error) {
+      this.server?.close();
+      this.server = null;
+      this.releaseLock(lockPath);
+      throw error;
     }
-    const server = net.createServer((socket) => this.accept(socket));
-    this.server = server;
+  }
+
+  private claimLock(lockPath: string): void {
+    const refuse: () => never = () => {
+      throw new Error(`Another runner already serves socket ${this.opts.socketPath}`);
+    };
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      let descriptor: number;
+      try {
+        descriptor = fs.openSync(lockPath, "wx");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+          if (attempt > 0) refuse();
+          throw error;
+        }
+        const owner = readLockOwner(lockPath);
+        if (owner === null) refuse();
+        const pid = Number(owner);
+        // A pid outside the operating system's range cannot be running.
+        const owned = Number.isSafeInteger(pid) && pid > 0 && pid <= 0x7fffffff && isProcessAlive(pid);
+        if (owned) refuse();
+        try {
+          fs.unlinkSync(lockPath);
+        } catch {
+          refuse();
+        }
+        continue;
+      }
+      try {
+        fs.writeFileSync(descriptor, String(process.pid));
+      } catch (error) {
+        fs.closeSync(descriptor);
+        try { fs.unlinkSync(lockPath); } catch { /* lock cleanup is best effort */ }
+        throw error;
+      }
+      fs.closeSync(descriptor);
+      this.ownsLock = true;
+      return;
+    }
+    refuse();
+  }
+
+  private releaseLock(lockPath: string): void {
+    if (!this.ownsLock) return;
+    this.ownsLock = false;
     try {
-      fs.rmSync(this.opts.socketPath, { force: true });
-    } catch { /* a stale socket that cannot be removed fails the listen below */ }
-    await new Promise<void>((resolve, reject) => {
-      const onError = (error: Error): void => {
-        server.removeListener("listening", onListening);
-        reject(error);
-      };
-      const onListening = (): void => {
-        server.off("error", onError);
-        resolve();
-      };
-      server.once("error", onError);
-      server.once("listening", onListening);
-      server.listen(this.opts.socketPath);
-    });
-    // The socket carries seat traffic: keep it owner-only.
-    try {
-      fs.chmodSync(this.opts.socketPath, 0o600);
-    } catch { /* best effort — the seat directory already restricts access */ }
+      fs.rmSync(lockPath, { force: true });
+    } catch { /* already gone */ }
   }
 
   /** Stop serving and remove the socket file. */
   close(): void {
+    const ownedSocket = this.ownsLock;
     this.failAwaiting("bridge server closed");
     this.bridgeSocket?.end();
     this.bridgeSocket = null;
     this.server?.close();
     this.server = null;
-    try {
-      fs.rmSync(this.opts.socketPath, { force: true });
-    } catch { /* already gone */ }
+    if (ownedSocket) {
+      try {
+        fs.rmSync(this.opts.socketPath, { force: true });
+      } catch { /* already gone */ }
+    }
+    this.releaseLock(`${this.opts.socketPath}.lock`);
   }
 
   /**
