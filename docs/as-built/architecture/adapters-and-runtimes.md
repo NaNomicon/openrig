@@ -323,7 +323,7 @@ fake `omp` on `PATH` and asserts the child reports that size
 a call site that stops using the helper cannot slip past it either.
 
 Because the TUI cannot be scraped or typed into, an OpenRig-shipped extension
-(`omp-tui-bridge.ts`, loaded by OMP through `--trusted-extension`) runs inside
+(`omp-tui-extension.ts`, loaded by OMP through `--trusted-extension`) runs inside
 the OMP process and talks to the runner over a Unix socket
 (`<seatRoot>/omp-bridge.sock`):
 
@@ -528,6 +528,6 @@ module.
   snapshot/restore (resume vs rebuild vs fresh).
 - `architecture-rules-and-event-system.md` — the full architecture rule list.
 - Source roots: `packages/daemon/src/domain/runtime-adapter.ts`,
-  `packages/daemon/src/adapters/{claude-code-adapter,codex-runtime-adapter,pi-runtime-adapter,omp-runtime-adapter,omp-tui-runtime-adapter,omp-tui-bridge,omp-bridge-protocol,omp-bridge-server,stub-runtime-adapter,terminal-adapter,yolo-mode,non-interruptive,kernel-authority}.ts`,
+  `packages/daemon/src/adapters/{claude-code-adapter,codex-runtime-adapter,pi-runtime-adapter,omp-runtime-adapter,omp-tui-runtime-adapter,omp-tui-extension,omp-bridge-protocol,omp-bridge-server,stub-runtime-adapter,terminal-adapter,yolo-mode,non-interruptive,kernel-authority}.ts`,
   `packages/daemon/src/domain/{native-resume-probe,resume-metadata-refresher,codex-thread-id,claude-managed-launch,codex-network-default,native-permission-store}.ts`,
   `packages/daemon/src/domain/permission-policy/policy-ref.ts`.

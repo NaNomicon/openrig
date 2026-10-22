@@ -1158,14 +1158,14 @@ function resolveScriptCommand(): string | null {
   return null;
 }
 
-/** The compiled bridge extension shipped next to this runner. OMP loads it
+/** The compiled OMP-side extension shipped next to this runner. OMP loads it
  *  with --trusted-extension, which requires an absolute path. The source tree
  *  (.ts, for a runner executed from source) is accepted too: Bun loads it. */
 function ompTuiBridgeExtensionPath(): string | null {
   const dir = nodePath.dirname(fileURLToPath(import.meta.url));
-  const compiled = nodePath.join(dir, "omp-tui-bridge.js");
+  const compiled = nodePath.join(dir, "omp-tui-extension.js");
   if (fs.existsSync(compiled)) return compiled;
-  const source = nodePath.join(dir, "omp-tui-bridge.ts");
+  const source = nodePath.join(dir, "omp-tui-extension.ts");
   return fs.existsSync(source) ? source : null;
 }
 
