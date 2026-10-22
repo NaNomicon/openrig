@@ -39,14 +39,22 @@ export interface OmpBridgeHandshake extends Record<string, unknown> {
   sessionFile?: string;
 }
 
+/**
+ * Commands the runner relays to the bridge (and the bridge applies). This list
+ * is the single source of truth: the command type is derived from it, so the
+ * runtime allowlist and the type cannot drift apart.
+ */
+export const OMP_BRIDGE_COMMAND_TYPES = [
+  "prompt",
+  "steer",
+  "follow_up",
+  "abort",
+  "get_state",
+  "get_entries",
+] as const;
+
 /** Commands the runner relays to the bridge (and the bridge applies). */
-export type OmpBridgeCommandType =
-  | "prompt"
-  | "steer"
-  | "follow_up"
-  | "abort"
-  | "get_state"
-  | "get_entries";
+export type OmpBridgeCommandType = (typeof OMP_BRIDGE_COMMAND_TYPES)[number];
 
 export interface OmpBridgeCommand {
   type: OmpBridgeCommandType;
@@ -58,14 +66,7 @@ export interface OmpBridgeCommand {
   since?: string;
 }
 
-const BRIDGE_COMMAND_TYPES: ReadonlySet<string> = new Set<OmpBridgeCommandType>([
-  "prompt",
-  "steer",
-  "follow_up",
-  "abort",
-  "get_state",
-  "get_entries",
-]);
+const BRIDGE_COMMAND_TYPES: ReadonlySet<string> = new Set<string>(OMP_BRIDGE_COMMAND_TYPES);
 
 /** Absolute path of the bridge socket for a seat state root. */
 export function ompBridgeSocketPath(seatRoot: string): string {

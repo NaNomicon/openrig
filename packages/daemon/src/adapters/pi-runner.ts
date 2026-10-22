@@ -633,6 +633,9 @@ export class RunnerCore {
     if (record.id === CURSOR_REFRESH_ID || record.id === CATCH_UP_ID) {
       const data = (record.data ?? record) as Record<string, unknown>;
       const entries = Array.isArray(data.entries) ? data.entries : (Array.isArray(record.entries) ? record.entries : []);
+      if (data.truncated === true) {
+        this.io.mirrorLine("[omp-runner] the bridge dropped older session entries from the catch-up reply; the cursor advanced to the newest entry");
+      }
       const last = entries.at(-1);
       const lastId = last !== null && typeof last === "object" && typeof (last as Record<string, unknown>).id === "string"
         ? (last as Record<string, unknown>).id as string

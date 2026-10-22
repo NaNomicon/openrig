@@ -3,7 +3,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import nodePath from "node:path";
-import { MAX_BRIDGE_FRAME_BYTES, OMP_BRIDGE_PROTOCOL_VERSION, createBridgeFrameDecoder } from "../src/adapters/omp-bridge-protocol.js";
+import { MAX_BRIDGE_FRAME_BYTES, OMP_BRIDGE_COMMAND_TYPES, OMP_BRIDGE_PROTOCOL_VERSION, createBridgeFrameDecoder, parseBridgeCommand } from "../src/adapters/omp-bridge-protocol.js";
 import { OmpBridgeServer } from "../src/adapters/omp-bridge-server.js";
 import { OmpTuiBridge, type BridgeApi, type BridgeContext } from "../src/adapters/omp-tui-bridge.js";
 
@@ -291,6 +291,83 @@ describe("the bridge socket routes both roles", () => {
 
     bridgeSocket.destroy();
     controlSocket.destroy();
+    server.close();
+  });
+});
+
+describe("the bridge bounds what it answers and refuses what it does not declare", () => {
+  it("answers a catch-up request with the entries after the cursor, capped and honest about the cap", async () => {
+    const socketPath = tempSocketPath("entries-cap");
+    const bridgeFrames = new FrameCollector();
+    const server = new OmpBridgeServer({
+      socketPath,
+      onBridgeFrame: (frame) => { bridgeFrames.add(frame); },
+      onControlFrame: () => { /* no control client in this case */ },
+    });
+    await server.start();
+    const { api, handlers } = fakeExtensionApi();
+    const bridge = new OmpTuiBridge(api, socketPath);
+    await bridge.start();
+    const ctx: BridgeContext = {
+      sessionManager: {
+        getSessionId: () => "session-1",
+        getSessionFile: () => "/state/omp/seat/sessions/2026_1.jsonl",
+        getEntries: () => Array.from({ length: 1200 }, (_, index) => ({ id: `entry-${index + 1}` })),
+      },
+    };
+    // An OMP event is what hands the bridge its session manager.
+    handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+
+    // The cursor filters: only the entries after it are answered.
+    server.sendToBridge({ type: "get_entries", id: "since-1", since: "entry-1198" });
+    const sinceReply = await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "since-1");
+    const sinceData = sinceReply.data as { entries: Array<{ id: string }>; truncated: boolean };
+    expect(sinceData.entries.map((entry) => entry.id)).toEqual(["entry-1199", "entry-1200"]);
+    expect(sinceData.truncated).toBe(false);
+
+    // A long answer is capped: the newest entries win, and the drop is reported.
+    server.sendToBridge({ type: "get_entries", id: "capped-1" });
+    const cappedReply = await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "capped-1");
+    const cappedData = cappedReply.data as { entries: Array<{ id: string }>; truncated: boolean };
+    expect(cappedData.entries).toHaveLength(500);
+    expect(cappedData.entries[0]).toEqual({ id: "entry-701" });
+    expect(cappedData.entries.at(-1)).toEqual({ id: "entry-1200" });
+    expect(cappedData.truncated).toBe(true);
+
+    bridge.close();
+    server.close();
+  });
+
+  it("applies only the command types the protocol declares", async () => {
+    // Every declared type is a command; anything else is not.
+    for (const type of OMP_BRIDGE_COMMAND_TYPES) {
+      expect(parseBridgeCommand({ type })).toMatchObject({ type });
+    }
+    expect(parseBridgeCommand({ type: "delete_everything" })).toBeNull();
+
+    const socketPath = tempSocketPath("undeclared");
+    const bridgeFrames = new FrameCollector();
+    const server = new OmpBridgeServer({
+      socketPath,
+      onBridgeFrame: (frame) => { bridgeFrames.add(frame); },
+      onControlFrame: () => { /* no control client in this case */ },
+    });
+    await server.start();
+    const { api, messages } = fakeExtensionApi();
+    const bridge = new OmpTuiBridge(api, socketPath);
+    await bridge.start();
+
+    // An undeclared type is not a command: it is never applied and never
+    // acknowledged, while the next declared command still is.
+    server.sendToBridge({ type: "delete_everything", id: "undeclared-1", message: "must not be delivered" });
+    server.sendToBridge({ type: "prompt", id: "declared-1", message: "delivered" });
+    expect(await bridgeFrames.waitFor((frame) => frame.type === "command_ack" && frame.id === "declared-1"))
+      .toMatchObject({ success: true });
+    expect(bridgeFrames.frames.filter((frame) => frame.type === "command_ack" && frame.id === "undeclared-1"))
+      .toHaveLength(0);
+    expect(messages).toEqual([{ content: "delivered", deliverAs: undefined }]);
+
+    bridge.close();
     server.close();
   });
 });

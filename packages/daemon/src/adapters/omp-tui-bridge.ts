@@ -44,6 +44,13 @@ const FORWARDED_EVENTS = [
   "tool_approval_resolved",
 ] as const;
 
+/**
+ * Maximum session entries one get_entries reply carries. The runner only
+ * needs the newest ids (it advances its catch-up cursor to the last one), so
+ * a long session is answered with its tail instead of an unbounded frame.
+ */
+const MAX_BRIDGE_ENTRIES = 500;
+
 /** The slice of OMP's session manager this extension reads. */
 export interface BridgeSessionManager {
   getSessionId(): string;
@@ -224,9 +231,10 @@ export class OmpTuiBridge {
         case "get_state":
           this.reply(command.id, { sessionId: this.sessionId, sessionFile: this.sessionFile });
           break;
-        case "get_entries":
-          this.reply(command.id, { entries: this.entries() });
+        case "get_entries": {
+          this.reply(command.id, this.entries(command.since));
           break;
+        }
         case "prompt":
         case "steer":
         case "follow_up": {
@@ -243,18 +251,30 @@ export class OmpTuiBridge {
     }
   }
 
-  /** The session entries the runner can advance its catch-up cursor over. */
-  private entries(): Array<{ id: string }> {
+  /**
+   * The session entries the runner can advance its catch-up cursor over. Only
+   * the entries after the cursor are wanted, and the reply is capped: a long
+   * session answers with its newest entries and says that it dropped the rest.
+   */
+  private entries(since?: string): { entries: Array<{ id: string }>; truncated: boolean } {
     const manager = this.ctx?.sessionManager;
-    if (!manager || typeof manager.getEntries !== "function") return [];
-    const entries = manager.getEntries();
-    if (!Array.isArray(entries)) return [];
-    const out: Array<{ id: string }> = [];
-    for (const entry of entries) {
+    if (!manager || typeof manager.getEntries !== "function") return { entries: [], truncated: false };
+    const all = manager.getEntries();
+    if (!Array.isArray(all)) return { entries: [], truncated: false };
+    const ids: string[] = [];
+    let caughtUp = since === undefined;
+    for (const entry of all) {
       const id = entryId(entry);
-      if (id) out.push({ id });
+      if (!id) continue;
+      if (!caughtUp) {
+        if (id === since) caughtUp = true;
+        continue;
+      }
+      ids.push(id);
     }
-    return out;
+    const truncated = ids.length > MAX_BRIDGE_ENTRIES;
+    if (truncated) ids.splice(0, ids.length - MAX_BRIDGE_ENTRIES);
+    return { entries: ids.map((id) => ({ id })), truncated };
   }
 
 
