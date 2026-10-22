@@ -20,6 +20,9 @@ import nodePath from "node:path";
 /** Wire version. Bumped only for a breaking change in frame shapes. */
 export const OMP_BRIDGE_PROTOCOL_VERSION = 1;
 
+/** Maximum UTF-8 frame size, excluding the newline delimiter. */
+export const MAX_BRIDGE_FRAME_BYTES = 1024 * 1024;
+
 /** Socket file name inside the seat state root (<stateRoot>/<sessionName>/). */
 export const OMP_BRIDGE_SOCKET_NAME = "omp-bridge.sock";
 
@@ -89,23 +92,48 @@ export function parseBridgeFrame(line: string): Record<string, unknown> | null {
 }
 
 /**
- * Incremental newline-delimited frame decoder. A chunk may carry half a frame
- * or several frames; undecoded bytes stay buffered until their newline lands.
+ * Incremental newline-delimited frame decoder. Malformed or oversized frames
+ * fail closed; onError lets socket owners destroy the offending connection.
  */
 export function createBridgeFrameDecoder(
   onFrame: (frame: Record<string, unknown>) => void,
+  onError: (error: Error) => void = () => {},
 ): { push(chunk: string): void } {
   let buffer = "";
+  let failed = false;
   return {
     push(chunk: string): void {
-      buffer += chunk;
-      let index = buffer.indexOf("\n");
-      while (index !== -1) {
-        const line = buffer.slice(0, index);
-        buffer = buffer.slice(index + 1);
+      if (failed) return;
+      let remaining = chunk;
+      while (true) {
+        const index = remaining.indexOf("\n");
+        if (index === -1) {
+          if (Buffer.byteLength(buffer, "utf8") + Buffer.byteLength(remaining, "utf8") > MAX_BRIDGE_FRAME_BYTES) {
+            failed = true;
+            buffer = "";
+            onError(new Error(`bridge frame exceeds ${MAX_BRIDGE_FRAME_BYTES} bytes`));
+            return;
+          }
+          buffer += remaining;
+          return;
+        }
+        const part = remaining.slice(0, index);
+        if (Buffer.byteLength(buffer, "utf8") + Buffer.byteLength(part, "utf8") > MAX_BRIDGE_FRAME_BYTES) {
+          failed = true;
+          buffer = "";
+          onError(new Error(`bridge frame exceeds ${MAX_BRIDGE_FRAME_BYTES} bytes`));
+          return;
+        }
+        const line = buffer + part;
+        buffer = "";
         const frame = parseBridgeFrame(line);
+        if (line.trim() && !frame) {
+          failed = true;
+          onError(new Error("malformed bridge frame"));
+          return;
+        }
         if (frame) onFrame(frame);
-        index = buffer.indexOf("\n");
+        remaining = remaining.slice(index + 1);
       }
     },
   };

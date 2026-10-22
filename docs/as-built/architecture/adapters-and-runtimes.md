@@ -339,6 +339,20 @@ sidecar keep working unchanged. A Rig message therefore reaches OMP's own
 conversation instead of being typed into the pane
 (`SessionTransport.sendUnguarded` calls the adapter's `deliverMessage`).
 
+Delivery is acknowledged, not timed: the control frame carries a command id,
+the extension applies the command and answers with a `command_ack` frame for
+that id, and the runner routes the acknowledgement back to the control
+socket. `deliverMessage` waits for it (3 s) and fails when the bridge
+rejects the command, when the bridge is gone, or when the command queue
+overflows — a delivery is never reported as sent on a timer. The
+acknowledgement proves the extension dispatched the message into OMP's
+session API; OMP's own `sendUserMessage` is fire-and-forget and the pane is
+OMP's, so it proves nothing about a rendered or answered message. The
+transport therefore reports the outcome as `proxied`. Frames are
+newline-delimited JSON capped at 1 MiB (`MAX_BRIDGE_FRAME_BYTES`): an
+oversized or malformed frame closes that connection instead of buffering
+without bound.
+
 The native TUI is the only approval authority: the runner neither cancels
 `extension_ui_request` nor raises a permission prompt, and readiness waits
 for the bridge's identity frame instead of a `get_state` reply. Resume tokens
@@ -364,8 +378,9 @@ mirrored transcript. `<seatRoot>/runner.log` records "bridge socket
 listening at …", "waiting for the bridge to report the session identity" and
 then "READY session=…", and the sidecar `runner-state.json` gets
 `ready: true` with the OMP session file. A Rig message then arrives through
-the control role of that same socket and OMP answers in the same
-conversation; the pane is never typed into.
+the control role of that same socket — the control client sends a command id
+and waits for the `command_ack` frame with that id — and OMP answers in the
+same conversation; the pane is never typed into.
 
 Rig-level check (a scratch `OPENRIG_HOME` + daemon on a spare port, so the
 operator's rig is untouched): start the daemon with `OPENRIG_URL` and

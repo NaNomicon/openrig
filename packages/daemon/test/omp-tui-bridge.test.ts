@@ -3,7 +3,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import nodePath from "node:path";
-import { OMP_BRIDGE_PROTOCOL_VERSION } from "../src/adapters/omp-bridge-protocol.js";
+import { MAX_BRIDGE_FRAME_BYTES, OMP_BRIDGE_PROTOCOL_VERSION, createBridgeFrameDecoder } from "../src/adapters/omp-bridge-protocol.js";
 import { OmpBridgeServer } from "../src/adapters/omp-bridge-server.js";
 import { OmpTuiBridge, type BridgeApi, type BridgeContext } from "../src/adapters/omp-tui-bridge.js";
 
@@ -111,10 +111,12 @@ describe("the OMP bridge reports events and applies commands", () => {
 
     // A Rig message becomes OMP's own user message; steer and follow-up keep
     // their delivery modes, and abort cancels the running turn.
-    server.sendToBridge({ type: "prompt", message: "hello" });
-    server.sendToBridge({ type: "steer", message: "turn left" });
-    server.sendToBridge({ type: "follow_up", message: "then this" });
-    server.sendToBridge({ type: "abort" });
+    server.sendToBridge({ type: "prompt", id: "prompt-1", message: "hello" });
+    server.sendToBridge({ type: "steer", id: "steer-1", message: "turn left" });
+    server.sendToBridge({ type: "follow_up", id: "follow-1", message: "then this" });
+    server.sendToBridge({ type: "abort", id: "abort-1" });
+    // The bridge applies a command asynchronously, so the applied messages are
+    // proven by the wait, not by the order of the writes above.
     await waitForMessages(3);
     expect(messages).toEqual([
       { content: "hello", deliverAs: undefined },
@@ -122,6 +124,13 @@ describe("the OMP bridge reports events and applies commands", () => {
       { content: "then this", deliverAs: "followUp" },
     ]);
     expect(aborted).toBe(true);
+    for (const id of ["prompt-1", "steer-1", "follow-1", "abort-1"]) {
+      expect(await bridgeFrames.waitFor((frame) => frame.type === "command_ack" && frame.id === id))
+        .toMatchObject({ type: "command_ack", id, success: true });
+    }
+    server.sendToBridge({ type: "prompt", id: "empty-prompt" });
+    expect(await bridgeFrames.waitFor((frame) => frame.type === "command_ack" && frame.id === "empty-prompt"))
+      .toMatchObject({ success: false, error: "command message is empty" });
 
     // A state request is answered in the RPC response shape.
     server.sendToBridge({ type: "get_state", id: "state-1" });
@@ -131,12 +140,16 @@ describe("the OMP bridge reports events and applies commands", () => {
       success: true,
       data: { sessionId: "session-1", sessionFile: "/state/omp/seat/sessions/2026_1.jsonl" },
     });
+    expect(await bridgeFrames.waitFor((frame) => frame.type === "command_ack" && frame.id === "state-1"))
+      .toMatchObject({ success: true });
 
     // Entry ids let the runner advance its durable cursor.
     server.sendToBridge({ type: "get_entries", id: "entries-1" });
     expect(await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "entries-1")).toMatchObject({
       data: { entries: [{ id: "entry-1" }, { id: "entry-2" }] },
     });
+    expect(await bridgeFrames.waitFor((frame) => frame.type === "command_ack" && frame.id === "entries-1"))
+      .toMatchObject({ success: true });
 
     expect(controlFrames.frames).toHaveLength(0);
     bridge.close();
@@ -168,7 +181,69 @@ describe("the OMP bridge reports events and applies commands", () => {
     bridge.close();
     server.close();
   });
+
+  it("closes a socket that sends an oversized unterminated frame", async () => {
+    const socketPath = tempSocketPath("oversized");
+    const server = new OmpBridgeServer({
+      socketPath,
+      onBridgeFrame: () => {},
+      onControlFrame: () => {},
+    });
+    await server.start();
+    const socket = net.connect({ path: socketPath });
+    await new Promise<void>((resolve) => socket.once("connect", resolve));
+    const closed = new Promise<void>((resolve) => socket.once("close", resolve));
+    socket.write(`${"x".repeat(MAX_BRIDGE_FRAME_BYTES + 1)}`);
+    await closed;
+    expect(socket.destroyed).toBe(true);
+    server.close();
+  });
+
+  it("closes a socket after a malformed frame", async () => {
+    const socketPath = tempSocketPath("malformed");
+    const server = new OmpBridgeServer({
+      socketPath,
+      onBridgeFrame: () => {},
+      onControlFrame: () => {},
+    });
+    await server.start();
+    const socket = net.connect({ path: socketPath });
+    await new Promise<void>((resolve) => socket.once("connect", resolve));
+    const closed = new Promise<void>((resolve) => socket.once("close", resolve));
+    socket.write("{not-json}\n");
+    await closed;
+    expect(socket.destroyed).toBe(true);
+    server.close();
+  });
 });
+
+  it("routes extension acknowledgement to originating control socket", async () => {
+    const socketPath = tempSocketPath("control-ack");
+    const bridgeFrames = new FrameCollector();
+    let server: OmpBridgeServer;
+    server = new OmpBridgeServer({
+      socketPath,
+      onBridgeFrame: (frame) => { bridgeFrames.add(frame); },
+      onControlFrame: (frame) => server.sendToBridge(frame),
+    });
+    await server.start();
+    const { api, messages } = fakeExtensionApi();
+    const bridge = new OmpTuiBridge(api, socketPath);
+    await bridge.start();
+    const control = net.connect({ path: socketPath });
+    const controlFrames = new FrameCollector();
+    const decoder = createBridgeFrameDecoder((frame) => controlFrames.add(frame));
+    control.on("data", (chunk: Buffer) => decoder.push(chunk.toString("utf8")));
+    await new Promise<void>((resolve) => control.once("connect", resolve));
+    control.write(`${JSON.stringify({ role: "control", protocolVersion: OMP_BRIDGE_PROTOCOL_VERSION })}\n`);
+    control.write(`${JSON.stringify({ type: "prompt", id: "control-prompt", message: "ack me" })}\n`);
+    expect(await controlFrames.waitFor((frame) => frame.type === "command_ack"))
+      .toMatchObject({ type: "command_ack", id: "control-prompt", success: true });
+    expect(messages).toEqual([{ content: "ack me", deliverAs: undefined }]);
+    control.destroy();
+    bridge.close();
+    server.close();
+  });
 
 describe("the bridge socket routes both roles", () => {
   it("relays a control client's command to the bridge and queues commands sent too early", async () => {

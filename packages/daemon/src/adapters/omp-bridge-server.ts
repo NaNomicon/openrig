@@ -45,7 +45,9 @@ const MAX_PENDING_COMMANDS = 64;
 export class OmpBridgeServer {
   private server: net.Server | null = null;
   private bridgeSocket: net.Socket | null = null;
-  private readonly pending: string[] = [];
+  private readonly pending: Array<{ payload: string; control?: net.Socket; id?: string }> = [];
+  private readonly awaiting = new Map<string, net.Socket>();
+  private activeControlSocket: net.Socket | null = null;
 
   constructor(private readonly opts: OmpBridgeServerOptions) {}
 
@@ -87,6 +89,7 @@ export class OmpBridgeServer {
 
   /** Stop serving and remove the socket file. */
   close(): void {
+    this.failAwaiting("bridge server closed");
     this.bridgeSocket?.end();
     this.bridgeSocket = null;
     this.server?.close();
@@ -100,22 +103,54 @@ export class OmpBridgeServer {
    * Send one frame to the OMP-side bridge. While the bridge is still
    * starting, the frame is queued and flushed on connect.
    */
-  sendToBridge(frame: Record<string, unknown>): void {
+  sendToBridge(frame: Record<string, unknown>, control?: net.Socket): void {
     const payload = encodeBridgeFrame(frame);
+    const id = typeof frame.id === "string" ? frame.id : undefined;
+    const origin = control ?? this.activeControlSocket ?? undefined;
+    if (origin && id) this.awaiting.set(id, origin);
     if (!this.bridgeSocket) {
-      if (this.pending.length < MAX_PENDING_COMMANDS) this.pending.push(payload);
+      if (this.pending.length < MAX_PENDING_COMMANDS) {
+        this.pending.push({ payload, control: origin, id });
+      } else if (origin && id) {
+        this.awaiting.delete(id);
+        this.sendAck(origin, id, false, "bridge command queue is full");
+      }
       return;
     }
-    this.writeToBridge(payload);
+    this.writeToBridge(payload, origin, id);
   }
 
-  private writeToBridge(payload: string): void {
+  private sendAck(socket: net.Socket, id: string, success: boolean, error?: string): void {
+    if (!socket.destroyed) socket.write(encodeBridgeFrame({ type: "command_ack", id, success, ...(error ? { error } : {}) }));
+  }
+
+  private failAwaiting(reason: string): void {
+    for (const [id, socket] of this.awaiting) this.sendAck(socket, id, false, reason);
+    this.awaiting.clear();
+  }
+
+  private writeToBridge(payload: string, control?: net.Socket, id?: string): void {
     const socket = this.bridgeSocket;
-    if (!socket) return;
+    if (!socket) {
+      if (control && id) {
+        this.awaiting.delete(id);
+        this.sendAck(control, id, false, "bridge disconnected before command delivery");
+      }
+      return;
+    }
     try {
-      socket.write(payload);
+      socket.write(payload, (error) => {
+        if (error && control && id) {
+          this.awaiting.delete(id);
+          this.sendAck(control, id, false, error.message);
+        }
+      });
     } catch (error) {
       this.opts.onLog?.(`[omp-bridge] write to bridge failed: ${(error as Error).message}`);
+      if (control && id) {
+        this.awaiting.delete(id);
+        this.sendAck(control, id, false, (error as Error).message);
+      }
     }
   }
 
@@ -132,7 +167,10 @@ export class OmpBridgeServer {
         if (role === "bridge") {
           this.bridgeSocket = socket;
           socket.on("close", () => {
-            if (this.bridgeSocket === socket) this.bridgeSocket = null;
+            if (this.bridgeSocket === socket) {
+              this.bridgeSocket = null;
+              this.failAwaiting("bridge disconnected before acknowledgement");
+            }
           });
           this.opts.onBridgeReady?.(frame);
           this.flushPending();
@@ -140,14 +178,32 @@ export class OmpBridgeServer {
         return;
       }
       if (role === "bridge") {
+        if (frame.type === "command_ack" && typeof frame.id === "string") {
+          const control = this.awaiting.get(frame.id);
+          if (control) {
+            this.awaiting.delete(frame.id);
+            if (!control.destroyed) control.write(encodeBridgeFrame(frame));
+            return;
+          }
+        }
         this.opts.onBridgeFrame(frame);
         return;
       }
-      this.opts.onControlFrame(frame);
+      this.activeControlSocket = socket;
+      try {
+        this.opts.onControlFrame(frame);
+      } finally {
+        this.activeControlSocket = null;
+      }
+      return;
+    }, (error) => {
+      this.opts.onLog?.(`[omp-bridge] rejected connection: ${error.message}`);
+      socket.destroy();
     });
-    socket.on("data", (chunk: Buffer) => {
-      decoder.push(chunk.toString("utf8"));
+    socket.on("close", () => {
+      for (const [id, control] of this.awaiting) if (control === socket) this.awaiting.delete(id);
     });
+    socket.on("data", (chunk: Buffer) => decoder.push(chunk.toString("utf8")));
     socket.on("error", (error: Error) => {
       this.opts.onLog?.(`[omp-bridge] connection error: ${error.message}`);
     });
@@ -155,12 +211,12 @@ export class OmpBridgeServer {
 
   private flushPending(): void {
     while (this.pending.length > 0) {
-      const payload = this.pending.shift();
-      if (payload === undefined) break;
-      this.writeToBridge(payload);
+      const pending = this.pending.shift();
+      if (pending) this.writeToBridge(pending.payload, pending.control, pending.id);
     }
   }
 }
+
 
 /** The handshake frame a control client sends before its first command. */
 export function controlHandshakeFrame(): Record<string, unknown> {

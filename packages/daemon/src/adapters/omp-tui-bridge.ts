@@ -63,7 +63,7 @@ export interface BridgeApi {
   sendUserMessage(
     content: string,
     options?: { deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" },
-  ): void;
+  ): void | Promise<void>;
   getSessionName?(): string | undefined;
 }
 
@@ -103,8 +103,8 @@ export class OmpTuiBridge {
     await this.connect();
     this.registerEventHandlers();
     const decoder = createBridgeFrameDecoder((frame) => {
-      this.applyCommand(frame);
-    });
+      void this.applyCommand(frame);
+    }, () => this.socket?.destroy());
     this.socket?.on("data", (chunk: Buffer) => {
       decoder.push(chunk.toString("utf8"));
     });
@@ -203,36 +203,43 @@ export class OmpTuiBridge {
   }
 
   private reply(id: string | undefined, data: Record<string, unknown>): void {
-    // The runner routes every reply through the same response handler the RPC
-    // child's answers use, so the frame carries the response type.
     this.write({ type: "response", id: id ?? "", success: true, data });
   }
 
-  /** Apply one command frame from the runner. */
-  applyCommand(frame: Record<string, unknown>): void {
+  private acknowledge(id: string | undefined, success: boolean, error?: string): void {
+    if (!id) return;
+    this.write({ type: "command_ack", id, success, ...(error ? { error } : {}) });
+  }
+
+  /** Apply one command frame from the runner, then acknowledge its outcome. */
+  async applyCommand(frame: Record<string, unknown>): Promise<void> {
     const command = parseBridgeCommand(frame);
     if (!command) return;
-    switch (command.type) {
-      case "abort":
-        this.ctx?.abort?.();
-        return;
-      case "get_state":
-        this.reply(command.id, { sessionId: this.sessionId, sessionFile: this.sessionFile });
-        return;
-      case "get_entries":
-        this.reply(command.id, { entries: this.entries() });
-        return;
-      case "prompt":
-      case "steer":
-      case "follow_up": {
-        const message = command.message ?? "";
-        if (!message) return;
-        const deliverAs = bridgeCommandDeliversAs(command.type);
-        this.api.sendUserMessage(message, deliverAs ? { deliverAs } : undefined);
-        return;
+    try {
+      switch (command.type) {
+        case "abort":
+          if (!this.ctx?.abort) throw new Error("OMP abort is unavailable");
+          this.ctx.abort();
+          break;
+        case "get_state":
+          this.reply(command.id, { sessionId: this.sessionId, sessionFile: this.sessionFile });
+          break;
+        case "get_entries":
+          this.reply(command.id, { entries: this.entries() });
+          break;
+        case "prompt":
+        case "steer":
+        case "follow_up": {
+          const message = command.message ?? "";
+          if (!message) throw new Error("command message is empty");
+          const deliverAs = bridgeCommandDeliversAs(command.type);
+          await this.api.sendUserMessage(message, deliverAs ? { deliverAs } : undefined);
+          break;
+        }
       }
-      default:
-        return;
+      this.acknowledge(command.id, true);
+    } catch (error) {
+      this.acknowledge(command.id, false, error instanceof Error ? error.message : String(error));
     }
   }
 
