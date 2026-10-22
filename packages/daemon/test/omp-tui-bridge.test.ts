@@ -146,7 +146,7 @@ describe("the OMP bridge reports events and applies commands", () => {
     // Entry ids let the runner advance its durable cursor.
     server.sendToBridge({ type: "get_entries", id: "entries-1" });
     expect(await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "entries-1")).toMatchObject({
-      data: { entries: [{ id: "entry-1" }, { id: "entry-2" }] },
+      data: { entries: [{ id: "entry-1" }, { id: "entry-2" }], truncated: false, available: true },
     });
     expect(await bridgeFrames.waitFor((frame) => frame.type === "command_ack" && frame.id === "entries-1"))
       .toMatchObject({ success: true });
@@ -321,18 +321,103 @@ describe("the bridge bounds what it answers and refuses what it does not declare
     // The cursor filters: only the entries after it are answered.
     server.sendToBridge({ type: "get_entries", id: "since-1", since: "entry-1198" });
     const sinceReply = await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "since-1");
-    const sinceData = sinceReply.data as { entries: Array<{ id: string }>; truncated: boolean };
+    const sinceData = sinceReply.data as { entries: Array<{ id: string }>; truncated: boolean; available: boolean };
     expect(sinceData.entries.map((entry) => entry.id)).toEqual(["entry-1199", "entry-1200"]);
     expect(sinceData.truncated).toBe(false);
+    expect(sinceData.available).toBe(true);
+    // A middle cursor returns only newer entries, preserving session order.
+    server.sendToBridge({ type: "get_entries", id: "middle-1", since: "entry-800" });
+    const middleReply = await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "middle-1");
+    const middleData = middleReply.data as { entries: Array<{ id: string }>; truncated: boolean; available: boolean };
+    expect(middleData.entries.map((entry) => entry.id)).toEqual(
+      Array.from({ length: 400 }, (_, index) => `entry-${index + 801}`),
+    );
+    expect(middleData.truncated).toBe(false);
+    expect(middleData.available).toBe(true);
+    expect(middleData.entries.length).toBeLessThanOrEqual(500);
+
+    // A missing cursor cannot establish a catch-up boundary.
+    server.sendToBridge({ type: "get_entries", id: "missing-1", since: "not-present" });
+    const missingReply = await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "missing-1");
+    const missingData = missingReply.data as { entries: Array<{ id: string }>; truncated: boolean; available: boolean };
+    expect(missingData.entries).toHaveLength(500);
+    expect(missingData.entries[0]).toEqual({ id: "entry-701" });
+    expect(missingData.entries.at(-1)).toEqual({ id: "entry-1200" });
+    expect(missingData.truncated).toBe(true);
+    expect(missingData.available).toBe(true);
 
     // A long answer is capped: the newest entries win, and the drop is reported.
     server.sendToBridge({ type: "get_entries", id: "capped-1" });
     const cappedReply = await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "capped-1");
-    const cappedData = cappedReply.data as { entries: Array<{ id: string }>; truncated: boolean };
+    const cappedData = cappedReply.data as { entries: Array<{ id: string }>; truncated: boolean; available: boolean };
     expect(cappedData.entries).toHaveLength(500);
     expect(cappedData.entries[0]).toEqual({ id: "entry-701" });
     expect(cappedData.entries.at(-1)).toEqual({ id: "entry-1200" });
     expect(cappedData.truncated).toBe(true);
+    expect(cappedData.available).toBe(true);
+    expect(cappedData.entries.length).toBeLessThanOrEqual(500);
+
+    bridge.close();
+    server.close();
+  });
+
+  it("reports unavailable entries when the session manager cannot read them", async () => {
+    const contexts: BridgeContext[] = [
+      {},
+      {
+        sessionManager: {
+          getSessionId: () => "session-1",
+          getSessionFile: () => undefined,
+        },
+      },
+    ];
+    for (const [index, ctx] of contexts.entries()) {
+      const socketPath = tempSocketPath(`entries-unavailable-${index}`);
+      const bridgeFrames = new FrameCollector();
+      const server = new OmpBridgeServer({
+        socketPath,
+        onBridgeFrame: (frame) => { bridgeFrames.add(frame); },
+        onControlFrame: () => { /* no control client in this case */ },
+      });
+      await server.start();
+      const { api, handlers } = fakeExtensionApi();
+      const bridge = new OmpTuiBridge(api, socketPath);
+      await bridge.start();
+      handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+
+      const id = `unavailable-${index}`;
+      server.sendToBridge({ type: "get_entries", id });
+      const reply = await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === id);
+      expect(reply.data).toEqual({ entries: [], truncated: false, available: false });
+
+      bridge.close();
+      server.close();
+    }
+  });
+
+  it("answers an empty readable session as available without truncation", async () => {
+    const socketPath = tempSocketPath("entries-empty");
+    const bridgeFrames = new FrameCollector();
+    const server = new OmpBridgeServer({
+      socketPath,
+      onBridgeFrame: (frame) => { bridgeFrames.add(frame); },
+      onControlFrame: () => { /* no control client in this case */ },
+    });
+    await server.start();
+    const { api, handlers } = fakeExtensionApi();
+    const bridge = new OmpTuiBridge(api, socketPath);
+    await bridge.start();
+    handlers.get("agent_start")?.({ type: "agent_start" }, {
+      sessionManager: {
+        getSessionId: () => "session-1",
+        getSessionFile: () => undefined,
+        getEntries: () => [],
+      },
+    });
+
+    server.sendToBridge({ type: "get_entries", id: "empty-1" });
+    const reply = await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "empty-1");
+    expect(reply.data).toEqual({ entries: [], truncated: false, available: true });
 
     bridge.close();
     server.close();

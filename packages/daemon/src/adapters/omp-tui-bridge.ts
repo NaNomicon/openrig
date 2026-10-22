@@ -252,29 +252,46 @@ export class OmpTuiBridge {
   }
 
   /**
-   * The session entries the runner can advance its catch-up cursor over. Only
-   * the entries after the cursor are wanted, and the reply is capped: a long
-   * session answers with its newest entries and says that it dropped the rest.
+   * Read only the newest session entries the runner can advance its cursor
+   * over. Scanning backward bounds work and memory even for long sessions.
    */
-  private entries(since?: string): { entries: Array<{ id: string }>; truncated: boolean } {
+  private entries(since?: string): {
+    entries: Array<{ id: string }>;
+    truncated: boolean;
+    available: boolean;
+  } {
     const manager = this.ctx?.sessionManager;
-    if (!manager || typeof manager.getEntries !== "function") return { entries: [], truncated: false };
-    const all = manager.getEntries();
-    if (!Array.isArray(all)) return { entries: [], truncated: false };
-    const ids: string[] = [];
-    let caughtUp = since === undefined;
-    for (const entry of all) {
-      const id = entryId(entry);
-      if (!id) continue;
-      if (!caughtUp) {
-        if (id === since) caughtUp = true;
-        continue;
-      }
-      ids.push(id);
+    if (!manager || typeof manager.getEntries !== "function") {
+      return { entries: [], truncated: false, available: false };
     }
-    const truncated = ids.length > MAX_BRIDGE_ENTRIES;
-    if (truncated) ids.splice(0, ids.length - MAX_BRIDGE_ENTRIES);
-    return { entries: ids.map((id) => ({ id })), truncated };
+    const all = manager.getEntries();
+    if (!Array.isArray(all)) return { entries: [], truncated: false, available: false };
+    if (all.length === 0) return { entries: [], truncated: false, available: true };
+
+    const ids: string[] = [];
+    let cursorFound = since === undefined;
+    let truncated = false;
+    for (let index = all.length - 1; index >= 0; index--) {
+      const id = entryId(all[index]);
+      if (!id) continue;
+      if (!cursorFound) {
+        if (id === since) {
+          cursorFound = true;
+          break;
+        }
+        ids.push(id);
+      } else {
+        ids.push(id);
+      }
+      if (ids.length > MAX_BRIDGE_ENTRIES) {
+        ids.pop();
+        truncated = true;
+        break;
+      }
+    }
+    if (since !== undefined && !cursorFound) truncated = true;
+    ids.reverse();
+    return { entries: ids.map((id) => ({ id })), truncated, available: true };
   }
 
 
