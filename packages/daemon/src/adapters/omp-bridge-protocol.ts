@@ -192,18 +192,17 @@ export function bridgeCommandDeliversAs(
 }
 
 /**
- * Reconciliation key for one OMP event: the identity the event carries, used
- * to drop a duplicate that the same source reported twice. Events without an
- * identity (lifecycle markers) are never deduplicated.
+ * Reconciliation key for one OMP event. OMP update events carry no per-update
+ * identity, so an identity-only key drops every update after the first.
  */
 export function bridgeEventDedupeKey(event: Record<string, unknown>): string | null {
   const type = typeof event.type === "string" ? event.type : "";
-  if (!type) return null;
-  if (type.startsWith("tool_execution_")) {
+  if (!type || type.endsWith("_update")) return null;
+  if (type === "tool_execution_start" || type === "tool_execution_end") {
     const toolCallId = event.toolCallId;
     return typeof toolCallId === "string" && toolCallId ? `${type}:${toolCallId}` : null;
   }
-  if (type.startsWith("message_")) {
+  if (type === "message_start" || type === "message_end") {
     const messageId = event.messageId ?? event.id;
     return typeof messageId === "string" && messageId ? `${type}:${messageId}` : null;
   }
