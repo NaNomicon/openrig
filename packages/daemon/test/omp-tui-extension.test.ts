@@ -74,6 +74,7 @@ describe("the OMP bridge reports events and applies commands", () => {
         getSessionId: () => "session-1",
         getSessionFile: () => "/state/omp/seat/sessions/2026_1.jsonl",
         getLeafId: () => "entry-2",
+        getEntry: (id) => id === "entry-2" ? { id, parentId: "entry-1" } : { id, parentId: null },
       },
       abort: () => { aborted = true; },
     };
@@ -146,7 +147,7 @@ describe("the OMP bridge reports events and applies commands", () => {
     // The newest entry id lets the runner advance its durable cursor.
     server.sendToBridge({ type: "get_entries", id: "entries-1" });
     expect(await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "entries-1")).toMatchObject({
-      data: { entries: [{ id: "entry-2" }], truncated: false, available: true },
+      data: { entries: [{ id: "entry-1" }, { id: "entry-2" }], truncated: false, available: true, newestId: "entry-2" },
     });
     expect(await bridgeFrames.waitFor((frame) => frame.type === "command_ack" && frame.id === "entries-1"))
       .toMatchObject({ success: true });
@@ -296,7 +297,7 @@ describe("the bridge socket routes both roles", () => {
 });
 
 describe("the bridge bounds what it answers and refuses what it does not declare", () => {
-  it("answers entry refreshes with the newest id and reports skipped entries", async () => {
+  it("enumerates the append-order suffix after the caller cursor", async () => {
     const socketPath = tempSocketPath("entries-leaf");
     const bridgeFrames = new FrameCollector();
     const server = new OmpBridgeServer({
@@ -308,27 +309,94 @@ describe("the bridge bounds what it answers and refuses what it does not declare
     const { api, handlers } = fakeExtensionApi();
     const bridge = new OmpTuiBridge(api, socketPath);
     await bridge.start();
+    const tree = new Map([
+      ["entry-1197", null],
+      ["entry-1198", "entry-1197"],
+      ["entry-1199", "entry-1198"],
+      ["entry-1200", "entry-1199"],
+    ]);
     handlers.get("agent_start")?.({ type: "agent_start" }, {
       sessionManager: {
         getSessionId: () => "session-1",
         getSessionFile: () => undefined,
         getLeafId: () => "entry-1200",
+        getEntry: (id) => tree.has(id) ? { id, parentId: tree.get(id) } : undefined,
         getEntries: () => { throw new Error("entry list must not be copied"); },
       },
     });
 
-    server.sendToBridge({ type: "get_entries", id: "refresh-1" });
-    const refreshReply = await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "refresh-1");
-    expect(refreshReply.data).toEqual({ entries: [{ id: "entry-1200" }], truncated: false, available: true });
-
     server.sendToBridge({ type: "get_entries", id: "catch-up-1", since: "entry-1198" });
     const catchUpReply = await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "catch-up-1");
-    expect(catchUpReply.data).toEqual({ entries: [{ id: "entry-1200" }], truncated: true, available: true });
-
+    expect(catchUpReply.data).toEqual({
+      entries: [{ id: "entry-1199" }, { id: "entry-1200" }],
+      truncated: false, available: true, newestId: "entry-1200",
+    });
     server.sendToBridge({ type: "get_entries", id: "current-1", since: "entry-1200" });
     const currentReply = await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "current-1");
-    expect(currentReply.data).toEqual({ entries: [], truncated: false, available: true });
+    expect(currentReply.data).toEqual({ entries: [], truncated: false, available: true, newestId: "entry-1200" });
+    server.sendToBridge({ type: "get_entries", id: "unknown-1", since: "unknown" });
+    const unknownReply = await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "unknown-1");
+    expect(unknownReply.data).toEqual({ entries: [], truncated: true, available: true, newestId: "entry-1200" });
+    bridge.close();
+    server.close();
+  });
 
+  it("caps ancestry enumeration and reports truncation", async () => {
+    const socketPath = tempSocketPath("entries-cap");
+    const bridgeFrames = new FrameCollector();
+    const server = new OmpBridgeServer({ socketPath, onBridgeFrame: (frame) => { bridgeFrames.add(frame); }, onControlFrame: () => {} });
+    await server.start();
+    const { api, handlers } = fakeExtensionApi();
+    const bridge = new OmpTuiBridge(api, socketPath);
+    await bridge.start();
+    handlers.get("agent_start")?.({ type: "agent_start" }, {
+      sessionManager: {
+        getSessionId: () => "session-1", getSessionFile: () => undefined,
+        getLeafId: () => "id-1200", getEntry: (id) => {
+          const index = Number(id.slice(3));
+          return index > 0 ? { id, parentId: `id-${index - 1}` } : { id, parentId: null };
+        },
+      },
+    });
+    server.sendToBridge({ type: "get_entries", id: "cap-1" });
+    const reply = await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "cap-1");
+    expect(reply.data).toMatchObject({ truncated: true, available: true, newestId: "id-1200" });
+    expect((reply.data as { entries: Array<{ id: string }> }).entries).toHaveLength(1000);
+    expect((reply.data as { entries: Array<{ id: string }> }).entries.at(-1)).toEqual({ id: "id-1200" });
+    bridge.close();
+    server.close();
+  });
+
+  it("keeps the omitted entries recoverable when the range outgrows the reply budget", async () => {
+    const socketPath = tempSocketPath("entries-long-range");
+    const bridgeFrames = new FrameCollector();
+    const server = new OmpBridgeServer({
+      socketPath,
+      onBridgeFrame: (frame) => { bridgeFrames.add(frame); },
+      onControlFrame: () => {},
+    });
+    await server.start();
+    const { api, handlers } = fakeExtensionApi();
+    const bridge = new OmpTuiBridge(api, socketPath);
+    await bridge.start();
+    handlers.get("agent_start")?.({ type: "agent_start" }, {
+      sessionManager: {
+        getSessionId: () => "session-1", getSessionFile: () => undefined,
+        getLeafId: () => "id-1199", getEntry: (id) => {
+          const index = Number(id.slice(3));
+          return index > 0 ? { id, parentId: `id-${index - 1}` } : { id, parentId: null };
+        },
+      },
+    });
+    server.sendToBridge({ type: "get_entries", id: "long-range-1", since: "id-0" });
+    const reply = await bridgeFrames.waitFor((frame) => frame.type === "response" && frame.id === "long-range-1");
+    const entries = (reply.data as { entries: Array<{ id: string }> }).entries;
+    expect(reply.data).toMatchObject({ truncated: true, available: true, newestId: "id-1199" });
+    expect(entries).toHaveLength(1000);
+    // The oldest ids of the range come first, so the caller's cursor advances
+    // over enumerated entries only and the rest stays recoverable.
+    expect(entries[0]).toEqual({ id: "id-1" });
+    expect(entries.at(-1)).toEqual({ id: "id-1000" });
     bridge.close();
     server.close();
   });

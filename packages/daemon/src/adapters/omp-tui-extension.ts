@@ -20,7 +20,10 @@ import {
   createBridgeFrameDecoder,
   encodeBridgeFrame,
   parseBridgeCommand,
+  type OmpBridgeEntriesReply,
 } from "./omp-bridge-protocol.js";
+
+const MAX_ENUMERATED_ENTRIES = 1000;
 
 /** OMP session events the runner projects onto the seat's activity feed. */
 const FORWARDED_EVENTS = [
@@ -50,6 +53,7 @@ export interface BridgeSessionManager {
   getSessionId(): string;
   getSessionFile(): string | undefined;
   getLeafId?: () => string | null;
+  getEntry?: (id: string) => { id?: string; parentId?: string | null } | undefined;
 }
 
 /** The slice of OMP's extension context this extension uses. */
@@ -240,15 +244,16 @@ export class OmpTuiBridge {
   }
 
   /**
-   * This reply comes from one constant-time lookup; the session's entry list
-   * is never copied. It cannot enumerate entries between the caller's cursor
-   * and the newest entry, which is what `truncated` reports.
+   * The reply enumerates the entries after the caller's cursor by walking the
+   * leaf's parent chain: the chain is the session's current branch, so the
+   * ids below the cursor are exactly the ones the cursor has not seen.
+   *
+   * A cursor off that chain cannot identify a safe suffix, and a range longer
+   * than the reply budget cannot be carried whole. Both replies stay
+   * truncated, and both keep the omitted entries recoverable: the caller
+   * keeps its cursor behind them and asks again.
    */
-  private entries(since?: string): {
-    entries: Array<{ id: string }>;
-    truncated: boolean;
-    available: boolean;
-  } {
+  private entries(since?: string): OmpBridgeEntriesReply {
     const manager = this.ctx?.sessionManager;
     if (!manager || typeof manager.getLeafId !== "function") {
       return { entries: [], truncated: false, available: false };
@@ -258,15 +263,77 @@ export class OmpTuiBridge {
       return { entries: [], truncated: false, available: true };
     }
     if (since === newestId) {
-      return { entries: [], truncated: false, available: true };
+      return { entries: [], truncated: false, available: true, newestId };
     }
+    if (typeof manager.getEntry !== "function") {
+      return { entries: [], truncated: true, available: true, newestId };
+    }
+
+    const parentOf = (id: string): string | null => {
+      const parentId = manager.getEntry?.(id)?.parentId;
+      return typeof parentId === "string" && parentId.length > 0 ? parentId : null;
+    };
+
+    if (since === undefined) {
+      // No cursor yet: the caller wants the session's position, so the newest
+      // ids are the answer. The ids left out are older than the cursor this
+      // reply establishes, not a gap behind it.
+      const newest: string[] = [];
+      let currentId: string | null = newestId;
+      while (currentId !== null && newest.length < MAX_ENUMERATED_ENTRIES) {
+        newest.push(currentId);
+        currentId = parentOf(currentId);
+      }
+      newest.reverse();
+      return {
+        entries: newest.map((id) => ({ id })),
+        truncated: currentId !== null,
+        available: true,
+        newestId,
+      };
+    }
+
+    // A cursor: the answer is the range after it. The walk runs from the leaf
+    // (newest first) down to the cursor, so the range's oldest ids are the
+    // last ones seen. Keeping those — rather than the newest — lets the
+    // cursor advance one reply at a time while the omitted entries stay
+    // recoverable on the next catch-up.
+    const window: Array<string | undefined> = new Array<string | undefined>(MAX_ENUMERATED_ENTRIES);
+    let kept = 0;
+    let next = 0;
+    let rangeLength = 0;
+    let currentId: string | null = newestId;
+    let anchored = false;
+    while (currentId !== null) {
+      if (currentId === since) {
+        anchored = true;
+        break;
+      }
+      window[next] = currentId;
+      next = (next + 1) % MAX_ENUMERATED_ENTRIES;
+      kept = Math.min(kept + 1, MAX_ENUMERATED_ENTRIES);
+      rangeLength += 1;
+      currentId = parentOf(currentId);
+    }
+    if (!anchored) {
+      // The cursor is not on the leaf's path: no safe suffix exists, so the
+      // reply carries nothing and the caller's cursor stays where it is.
+      return { entries: [], truncated: true, available: true, newestId };
+    }
+    const ids: string[] = [];
+    for (let offset = 1; offset <= kept; offset += 1) {
+      const id = window[(next - offset + MAX_ENUMERATED_ENTRIES) % MAX_ENUMERATED_ENTRIES];
+      if (id !== undefined) ids.push(id);
+    }
+    // The window holds the oldest kept ids first, which is the append order
+    // the caller expects.
     return {
-      entries: [{ id: newestId }],
-      truncated: since !== undefined,
+      entries: ids.map((id) => ({ id })),
+      truncated: rangeLength > kept,
       available: true,
+      newestId,
     };
   }
-
 
   /** Write one frame to the runner. */
   write(frame: Record<string, unknown>): void {

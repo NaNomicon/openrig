@@ -649,13 +649,15 @@ export class RunnerCore {
         return;
       }
       if (data.truncated === true) {
-        this.io.mirrorLine("[omp-runner] the bridge reply did not enumerate entries between the cursor and newest entry; the cursor advanced to the newest entry");
+        this.io.mirrorLine("[omp-runner] the bridge reply did not enumerate every entry after the cursor; the cursor stayed at the last enumerated entry");
       }
       const last = entries.at(-1);
       const lastId = last !== null && typeof last === "object" && typeof (last as Record<string, unknown>).id === "string"
         ? (last as Record<string, unknown>).id as string
         : undefined;
       if (lastId) {
+        // A truncated reply leaves omitted entries recoverable: next catch-up
+        // starts after this enumerated id rather than skipping the gap.
         this.lastEntryId = lastId;
         this.writeSidecar({});
       }
@@ -809,7 +811,9 @@ export class RunnerCore {
       // null in real runs). Refresh it from the source of truth after every
       // completed turn — get_entries returns append-order entries with stable
       // ids; the response handler advances the cursor from the tail.
-      this.io.sendRpc({ type: "get_entries", id: CURSOR_REFRESH_ID });
+      this.io.sendRpc(this.opts.bridgeUi
+        ? { type: "get_entries", since: this.lastEntryId, id: CURSOR_REFRESH_ID }
+        : { type: "get_entries", id: CURSOR_REFRESH_ID });
     }
     if (mapped.mirrorAppend) this.io.mirrorAppend(mapped.mirrorAppend);
     for (const line of mapped.mirrorLines) this.io.mirrorLine(line);

@@ -38,6 +38,25 @@ export interface OmpBridgeHandshake extends Record<string, unknown> {
   /** Absolute OMP session-file path (bridge role only) — the resume token. */
   sessionFile?: string;
 }
+/**
+ * Reply to get_entries. Truncation means not every requested entry was
+ * enumerated, so the caller keeps its cursor behind omitted entries and can
+ * ask again; omitted entries remain recoverable. newestId is the session's
+ * newest entry id (the leaf), a position that need not appear in entries: a
+ * caller advances its cursor over the enumerated entries only, because the
+ * newest id is not an accounting of the entries a truncated reply left out.
+ */
+export interface OmpBridgeEntriesReply extends Record<string, unknown> {
+  /** The enumerated entry ids, in append order. */
+  entries: Array<{ id: string }>;
+  /** The session's newest entry id (the leaf). Absent when unknown. */
+  newestId?: string;
+  /** True when the reply did not enumerate every entry the caller asked for. */
+  truncated: boolean;
+  /** False when the bridge cannot read the session's entries at all. */
+  available: boolean;
+}
+
 
 /**
  * Commands the runner relays to the bridge (and the bridge applies). This list

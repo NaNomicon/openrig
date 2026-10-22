@@ -22,12 +22,13 @@ const USAGE_ENTRY = {
   },
 };
 
-function runner() {
+function runner(runtime: "omp" | "pi" = "pi", bridgeUi = false) {
   const mirror: string[] = [];
   const sidecars: PiRunnerState[] = [];
   const usageFacts: Record<string, unknown>[] = [];
+  const requests: Record<string, unknown>[] = [];
   const io: RunnerIo = {
-    sendRpc: () => {},
+    sendRpc: (request) => { requests.push(request); },
     mirrorLine: (line) => { mirror.push(line); },
     mirrorAppend: () => {},
     postActivity: () => {},
@@ -38,14 +39,14 @@ function runner() {
     now: () => "2026-10-21T12:00:00.000Z",
   };
   const core = new RunnerCore(io, { sessionName: SESSION, nodeId: "node-1", launchId: "attempt-1" }, {
-    catchUpSince: "entry-old", usageFacts: true,
+    catchUpSince: "entry-old", usageFacts: true, runtime, bridgeUi,
   });
   core.start();
   core.handlePiLine(JSON.stringify({
     type: "response", id: "pi-runner-get-state",
     data: { sessionFile: SESSION_FILE, sessionId: "session-1" },
   }));
-  return { core, mirror, sidecars, usageFacts };
+  return { core, mirror, sidecars, usageFacts, requests };
 }
 
 function catchUp(core: RunnerCore, data: Record<string, unknown>): void {
@@ -53,20 +54,21 @@ function catchUp(core: RunnerCore, data: Record<string, unknown>): void {
 }
 
 describe("OMP TUI runner catch-up replies", () => {
-  it("warns on truncated catch-up and advances cursor to newest entry", () => {
+  it("warns on truncated catch-up and advances only to last enumerated entry", () => {
     const { core, mirror, sidecars } = runner();
-    catchUp(core, { entries: [{ id: "entry-new" }, { id: "entry-newest" }], truncated: true });
+    catchUp(core, { entries: [{ id: "entry-new" }, { id: "entry-newest" }], newestId: "entry-latest", truncated: true });
 
-    expect(mirror).toContain("[omp-runner] the bridge reply did not enumerate entries between the cursor and newest entry; the cursor advanced to the newest entry");
+    expect(mirror).toContain("[omp-runner] the bridge reply did not enumerate every entry after the cursor; the cursor stayed at the last enumerated entry");
     expect(sidecars.at(-1)).toMatchObject({ lastEntryId: "entry-newest" });
   });
+});
 
+describe("OMP TUI runner catch-up replies", () => {
   it("rejects catch-up replies without an entries array", () => {
     for (const data of [{}, { entries: "not-an-array" }]) {
       const { core, mirror, sidecars, usageFacts } = runner();
       const sidecarCount = sidecars.length;
       catchUp(core, data);
-
       expect(mirror).toContain("[omp-runner] the bridge reply carried no entries; catch-up could not be verified");
       expect(sidecars).toHaveLength(sidecarCount);
       expect(sidecars.at(-1)).toMatchObject({ lastEntryId: "entry-old" });
@@ -74,6 +76,21 @@ describe("OMP TUI runner catch-up replies", () => {
     }
   });
 
+
+  it("complete reply advances cursor to last enumerated entry", () => {
+    const { core, sidecars } = runner();
+    catchUp(core, { entries: [{ id: "entry-mid" }, { id: "entry-last" }], newestId: "entry-latest", truncated: false });
+    expect(sidecars.at(-1)).toMatchObject({ lastEntryId: "entry-last" });
+  });
+
+  it("native refresh carries current cursor; Pi RPC refresh omits since", () => {
+    const native = runner("omp", true);
+    native.core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    expect(native.requests.at(-1)).toEqual({ type: "get_entries", since: "entry-old", id: "pi-runner-cursor-refresh" });
+    const pi = runner("pi");
+    pi.core.handlePiLine(JSON.stringify({ type: "agent_end" }));
+    expect(pi.requests.at(-1)).toEqual({ type: "get_entries", id: "pi-runner-cursor-refresh" });
+  });
   it("reports unavailable session entries without advancing cursor or reporting usage", () => {
     const { core, mirror, sidecars, usageFacts } = runner();
     const sidecarCount = sidecars.length;
