@@ -94,4 +94,11 @@ describe("OMP TUI runner catch-up replies", () => {
     expect(usageFacts).toHaveLength(1);
     expect(usageFacts[0]).toMatchObject({ facts: [expect.objectContaining({ entryId: "entry-newest" })] });
   });
+
+  it("does not move the durable cursor onto a command acknowledgement id", () => {
+    const { core, sidecars } = runner();
+    core.handlePiLine(JSON.stringify({ type: "command_ack", id: "pi-runner-get-state", success: true }));
+
+    expect(sidecars.at(-1)).toMatchObject({ lastEntryId: "entry-old" });
+  });
 });

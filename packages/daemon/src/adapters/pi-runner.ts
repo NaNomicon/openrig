@@ -520,6 +520,13 @@ export class RunnerCore {
       record = result.frame;
     }
 
+
+    if (record.type === "command_ack") {
+      // A command acknowledgement is bridge control traffic: it carries the
+      // id of a command, not a session-entry id, so it must not be treated as
+      // an event (it would move the durable cursor onto a command id).
+      return;
+    }
     if (record.type === "response") {
       this.handleResponse(record);
       return;
