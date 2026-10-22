@@ -317,7 +317,10 @@ directly; a piped stdin leaves the child pty at size `0 0` with no
 inherited tty). The wiring lives in one place — the tested helper
 `piChildSpawnOptions` in `pi-runner-protocol.ts`, pinned by
 `test/omp-tui-args.test.ts` — so the pty contract cannot drift per call
-site.
+site. A second pin runs the real runner inside a 30x100 `script` pty with a
+fake `omp` on `PATH` and asserts the child reports that size
+(`test/omp-tui-native-pty.test.ts`); it exercises the runner's own spawn, so
+a call site that stops using the helper cannot slip past it either.
 
 Because the TUI cannot be scraped or typed into, an OpenRig-shipped extension
 (`omp-tui-bridge.ts`, loaded by OMP through `--trusted-extension`) runs inside
