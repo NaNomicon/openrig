@@ -593,12 +593,13 @@ activityRoutes.get("/parked", (c) => {
   // (AM-3: the scope that ran is part of the answer). No resolvable scope is an honest
   // refusal, never a silent fold of every rig on the daemon.
   const seatParam = c.req.query("seat") || undefined;
-  const rigParam = c.req.query("rig") || undefined;
+  // An explicit scope must not silently become a different scope when its value is empty.
+  const rigParam = c.req.query("rig");
   const callerSession = transportSenderSession(c);
   let scope: { rig: string; resolvedFrom: "seat-coordinate" | "query-param" | "caller-session" } | null = null;
   if (seatParam?.includes("@")) {
     scope = { rig: seatParam.split("@")[1]!, resolvedFrom: "seat-coordinate" };
-  } else if (rigParam) {
+  } else if (rigParam !== undefined) {
     scope = { rig: rigParam, resolvedFrom: "query-param" };
   } else if (callerSession?.includes("@")) {
     // Canonical local form name@rig; a cross-host stamp name@rig@host parses the same.
