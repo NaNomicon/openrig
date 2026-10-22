@@ -5,7 +5,7 @@ import os from "node:os";
 import nodePath from "node:path";
 import { MAX_BRIDGE_FRAME_BYTES, OMP_BRIDGE_COMMAND_TYPES, OMP_BRIDGE_PROTOCOL_VERSION, createBridgeFrameDecoder, parseBridgeCommand } from "../src/adapters/omp-bridge-protocol.js";
 import { OmpBridgeServer } from "../src/adapters/omp-bridge-server.js";
-import { OmpTuiBridge, type BridgeApi, type BridgeContext } from "../src/adapters/omp-tui-bridge.js";
+import { OmpTuiBridge, type BridgeApi, type BridgeContext } from "../src/adapters/omp-tui-extension.js";
 
 /** A short socket path inside a fresh temp dir (Unix sockets cap at 108 chars). */
 function tempSocketPath(name: string): string {
@@ -355,10 +355,52 @@ describe("the bridge bounds what it answers and refuses what it does not declare
     expect(cappedData.entries.at(-1)).toEqual({ id: "entry-1200" });
     expect(cappedData.truncated).toBe(true);
     expect(cappedData.available).toBe(true);
-    expect(cappedData.entries.length).toBeLessThanOrEqual(500);
 
     bridge.close();
     server.close();
+  });
+
+  it("bounds indexed reads for 5,000-entry sessions with absent or missing cursors", async () => {
+    for (const [id, since] of [["bounded-no-cursor", undefined], ["bounded-missing-cursor", "not-present"]] as const) {
+      let indexedReads = 0;
+      const entries = Array.from({ length: 5000 }, (_, index) => ({ id: `entry-${index + 1}` }));
+      const countedEntries = new Proxy(entries, {
+        get(target, property, receiver) {
+          if (typeof property === "string" && /^(0|[1-9]\d*)$/.test(property)) indexedReads++;
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      const socketPath = tempSocketPath(id);
+      const frames = new FrameCollector();
+      const server = new OmpBridgeServer({
+        socketPath,
+        onBridgeFrame: (frame) => { frames.add(frame); },
+        onControlFrame: () => { /* no control client in this case */ },
+      });
+      await server.start();
+      const { api, handlers } = fakeExtensionApi();
+      const bridge = new OmpTuiBridge(api, socketPath);
+      await bridge.start();
+      handlers.get("agent_start")?.({ type: "agent_start" }, {
+        sessionManager: {
+          getSessionId: () => "session-1",
+          getSessionFile: () => undefined,
+          getEntries: () => countedEntries,
+        },
+      });
+
+      server.sendToBridge({ type: "get_entries", id, ...(since ? { since } : {}) });
+      const reply = await frames.waitFor((frame) => frame.type === "response" && frame.id === id);
+      const data = reply.data as { entries: Array<{ id: string }>; truncated: boolean; available: boolean };
+      expect(data.entries).toHaveLength(500);
+      expect(data.entries[0]).toEqual({ id: "entry-4501" });
+      expect(data.entries.at(-1)).toEqual({ id: "entry-5000" });
+      expect(data.truncated).toBe(true);
+      expect(data.available).toBe(true);
+      expect(indexedReads).toBeLessThanOrEqual(501);
+      bridge.close();
+      server.close();
+    }
   });
 
   it("reports unavailable entries when the session manager cannot read them", async () => {

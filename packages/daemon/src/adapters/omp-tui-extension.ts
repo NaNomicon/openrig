@@ -252,8 +252,10 @@ export class OmpTuiBridge {
   }
 
   /**
-   * Read only the newest session entries the runner can advance its cursor
-   * over. Scanning backward bounds work and memory even for long sessions.
+   * Each request examines at most MAX_BRIDGE_ENTRIES + 1 entries and keeps
+   * at most MAX_BRIDGE_ENTRIES ids. OMP's sessionManager.getEntries() returns
+   * a copy of the whole entry list; the extension API exposes no bounded
+   * accessor, so the bridge cannot bound that retrieval.
    */
   private entries(since?: string): {
     entries: Array<{ id: string }>;
