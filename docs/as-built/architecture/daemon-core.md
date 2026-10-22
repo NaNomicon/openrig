@@ -47,12 +47,14 @@ The footprint counts use non-test TypeScript files under each package's `src/`
 | `app.route(...)` mounts in `server.ts` | **69** | `grep -c 'app.route(' packages/daemon/src/server.ts` |
 | Top-level `rig` commands | **87** | `grep -c 'program.addCommand(' packages/cli/src/index.ts` |
 | MCP tools | **18**, all named `rig_*` | `grep -c 'server.tool(' packages/cli/src/mcp-server.ts` |
-| Runtime adapter classes | **5**: Claude Code, Codex, Pi, Stub, Terminal | `git grep -l 'implements RuntimeAdapter' packages/daemon/src \| wc -l` |
 
-`OmpRuntimeAdapter` (Oh My Pi) extends `PiRuntimeAdapter`, and
-`OmpTuiRuntimeAdapter` (the native-TUI seat) extends `OmpRuntimeAdapter`, so
-the daemon wires seven runtime keys — `claude-code`, `codex`, `pi`, `omp`,
-`omp-tui`, `stub`, `terminal` (`startup.ts:1062`).
+Six classes implement `RuntimeAdapter` — Claude Code, Codex, Community Harness,
+Pi, Stub and Terminal (`git grep -l 'implements RuntimeAdapter'
+packages/daemon/src | wc -l`). `OmpRuntimeAdapter` (Oh My Pi) extends
+`PiRuntimeAdapter`, and `OmpTuiRuntimeAdapter` (the native-TUI seat) extends
+`OmpRuntimeAdapter`. The daemon therefore wires seven runtime keys:
+`claude-code`, `codex`, `pi`, `omp`, `omp-tui`, `stub` and `terminal`
+(`packages/daemon/src/startup.ts:1062`).
 
 ### The stack
 
