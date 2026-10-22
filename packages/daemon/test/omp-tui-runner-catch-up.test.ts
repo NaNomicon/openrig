@@ -57,8 +57,21 @@ describe("OMP TUI runner catch-up replies", () => {
     const { core, mirror, sidecars } = runner();
     catchUp(core, { entries: [{ id: "entry-new" }, { id: "entry-newest" }], truncated: true });
 
-    expect(mirror).toContain("[omp-runner] the bridge dropped older session entries from the catch-up reply; the cursor advanced to the newest entry");
+    expect(mirror).toContain("[omp-runner] the bridge reply did not enumerate entries between the cursor and newest entry; the cursor advanced to the newest entry");
     expect(sidecars.at(-1)).toMatchObject({ lastEntryId: "entry-newest" });
+  });
+
+  it("rejects catch-up replies without an entries array", () => {
+    for (const data of [{}, { entries: "not-an-array" }]) {
+      const { core, mirror, sidecars, usageFacts } = runner();
+      const sidecarCount = sidecars.length;
+      catchUp(core, data);
+
+      expect(mirror).toContain("[omp-runner] the bridge reply carried no entries; catch-up could not be verified");
+      expect(sidecars).toHaveLength(sidecarCount);
+      expect(sidecars.at(-1)).toMatchObject({ lastEntryId: "entry-old" });
+      expect(usageFacts).toEqual([]);
+    }
   });
 
   it("reports unavailable session entries without advancing cursor or reporting usage", () => {

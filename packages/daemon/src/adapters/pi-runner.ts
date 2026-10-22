@@ -636,9 +636,13 @@ export class RunnerCore {
         this.io.mirrorLine("[omp-runner] could not read the session entries from the bridge; catch-up did not complete");
         return;
       }
-      const entries = Array.isArray(data.entries) ? data.entries : (Array.isArray(record.entries) ? record.entries : []);
+      const entries = Array.isArray(data.entries) ? data.entries : Array.isArray(record.entries) ? record.entries : undefined;
+      if (!entries) {
+        this.io.mirrorLine("[omp-runner] the bridge reply carried no entries; catch-up could not be verified");
+        return;
+      }
       if (data.truncated === true) {
-        this.io.mirrorLine("[omp-runner] the bridge dropped older session entries from the catch-up reply; the cursor advanced to the newest entry");
+        this.io.mirrorLine("[omp-runner] the bridge reply did not enumerate entries between the cursor and newest entry; the cursor advanced to the newest entry");
       }
       const last = entries.at(-1);
       const lastId = last !== null && typeof last === "object" && typeof (last as Record<string, unknown>).id === "string"
