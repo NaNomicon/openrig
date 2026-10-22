@@ -2,7 +2,7 @@
 //
 //   1. the seat runner  (packages/daemon/src/adapters/pi-runner.ts) — owns the
 //      Unix socket and routes frames between the other two;
-//   2. the OMP-side bridge extension (omp-tui-bridge.ts) — loaded INTO OMP,
+//   2. the OMP-side bridge extension (omp-tui-extension.ts) — loaded INTO OMP,
 //      reports OMP's session events and applies commands to the live session;
 //   3. the daemon's message writer (omp-tui-runtime-adapter.ts) — sends a Rig
 //      message into that same OMP conversation.
@@ -144,7 +144,7 @@ export function createBridgeFrameDecoder(
 export function isBridgeHandshake(frame: Record<string, unknown>): frame is OmpBridgeHandshake {
   const role = frame.role;
   if (role !== "bridge" && role !== "control") return false;
-  if (typeof frame.protocolVersion !== "number") return false;
+  if (frame.protocolVersion !== OMP_BRIDGE_PROTOCOL_VERSION) return false;
   return true;
 }
 
