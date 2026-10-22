@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildPiChildArgs, buildPiChildEnv, buildPiRunnerCommand } from "../src/adapters/pi-runner-protocol.js";
+import { buildPiChildArgs, buildPiChildEnv, buildPiRunnerCommand, piChildSpawnOptions } from "../src/adapters/pi-runner-protocol.js";
 
 const sessionsDir = "/state/worker/sessions";
 const sessionFile = "/state/worker/sessions/session.jsonl";
@@ -72,5 +72,26 @@ describe("OMP native TUI launch arguments", () => {
 
     expect(buildPiChildEnv({}, { ...base, bridgeSocketPath: "/state/worker/omp-bridge.sock" }))
       .toHaveProperty("OPENRIG_OMP_BRIDGE_SOCKET", "/state/worker/omp-bridge.sock");
+  });
+});
+
+describe("the native TUI child's spawn wiring", () => {
+  it("hands the pane's terminal to the native child and keeps the pipes in mirror mode", () => {
+    const env = { PATH: "/bin", HOME: "/state/worker" };
+    const native = piChildSpawnOptions("native", { cwd: "/work", env });
+
+    // A piped stdin leaves the child's pty at 0x0 with no SIGWINCH, so the
+    // TUI could neither size itself nor reflow when the pane was resized.
+    expect(native.stdio[0]).toBe("inherit");
+    expect(native.stdio[1]).toBe("inherit");
+    // The child's stderr stays a pipe: the runner still reads the startup
+    // error tail out of it.
+    expect(native.stdio[2]).toBe("pipe");
+    expect(native.cwd).toBe("/work");
+    expect(native.env).toEqual(env);
+
+    // Mirror mode keeps the pipes: there the runner owns the child's input
+    // and output.
+    expect(piChildSpawnOptions("mirror", { cwd: "/work", env }).stdio).toEqual(["pipe", "pipe", "pipe"]);
   });
 });

@@ -47,7 +47,7 @@ import { OMP_MAX_FRAME_BYTES, OmpFrameDecoder, ompProtocolV2Limit } from "./omp-
 import { ompBridgeSocketPath } from "./omp-bridge-protocol.js";
 import { OmpBridgeServer } from "./omp-bridge-server.js";
 import {
-  piSeatPaths, buildPiChildArgs, buildPiChildEnv, buildPendingRunnerState, parsePiRunnerState,
+  piSeatPaths, buildPiChildArgs, buildPiChildEnv, buildPendingRunnerState, parsePiRunnerState, piChildSpawnOptions,
   PI_RUNNER_READY_MARKER, PI_RUNNER_EXIT_MARKER, PI_RUNNER_ERROR_MARKER, PI_PROVIDER_ENV_VARS,
   type PiRunnerState, type RunnerRuntime, type RunnerUiMode,
 } from "./pi-runner-protocol.js";
@@ -1369,20 +1369,11 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     spawnCommand = launcher;
     spawnArgs = ["-qfec", shellCommandLine([command, ...childArgs]), "/dev/null"];
   }
-  // Native mode hands `script` the pane's own terminal: the pty then inherits
-  // the pane's termios and window size, and script forwards SIGWINCH, so
-  // OMP's TUI renders at the pane's width and reflows when the pane is
-  // resized. A piped stdin leaves the child's terminal at 0x0, which breaks
-  // both. Mirror mode keeps the pipes: there the runner owns the child's
-  // input and output.
-  const stdio: ["inherit" | "pipe", "inherit" | "pipe", "pipe"] = nativeTui
-    ? ["inherit", "inherit", "pipe"]
-    : ["pipe", "pipe", "pipe"];
-  const child = spawn(spawnCommand, spawnArgs, {
-    cwd: args.cwd,
-    env: childEnv,
-    stdio,
-  });
+  // The stdio wiring lives in one tested helper: native mode hands `script`
+  // the pane's own terminal, so the pty inherits the pane's termios and window
+  // size and `script` forwards SIGWINCH. A piped stdin leaves the child's
+  // terminal at 0x0, which breaks both the size and the reflow.
+  const child = spawn(spawnCommand, spawnArgs, piChildSpawnOptions(uiMode, { cwd: args.cwd, env: childEnv }));
 
   // The child may close its pipe before the first RPC write completes.
   child.stdin?.on("error", () => { /* spawn/exit handlers own the diagnosis */ });

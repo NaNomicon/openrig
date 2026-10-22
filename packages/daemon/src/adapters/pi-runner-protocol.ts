@@ -371,3 +371,30 @@ export function buildPiChildArgs(opts: {
   }
   return args;
 }
+
+/** The runner's child-process spawn options, by UI mode.
+ *
+ *  The stdio wiring is the load-bearing part. Native mode hands `script` the
+ *  pane's own terminal: the pty then inherits the pane's termios and window
+ *  size, and `script` forwards SIGWINCH, so OMP's TUI renders at the pane's
+ *  width and reflows when the pane is resized. A piped stdin leaves the
+ *  child's terminal at 0x0 with no SIGWINCH, which breaks both. Mirror mode
+ *  keeps the pipes: there the runner owns the child's input and output. */
+export interface PiChildSpawnOptions {
+  cwd: string;
+  env: Record<string, string>;
+  stdio: ["inherit" | "pipe", "inherit" | "pipe", "pipe"];
+}
+
+/** The options the runner spawns its child with. The stdio array exists in
+ *  exactly one place, so the pty wiring cannot drift per call site. */
+export function piChildSpawnOptions(
+  ui: RunnerUiMode,
+  opts: { cwd: string; env: Record<string, string> },
+): PiChildSpawnOptions {
+  return {
+    cwd: opts.cwd,
+    env: opts.env,
+    stdio: ui === "native" ? ["inherit", "inherit", "pipe"] : ["pipe", "pipe", "pipe"],
+  };
+}
