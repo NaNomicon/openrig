@@ -96,9 +96,10 @@ ends `attention_required`.
 `PiRuntimeAdapter`, `StubRuntimeAdapter` and `TerminalAdapter`. All live under
 `packages/daemon/src/adapters/` (Architecture Rule 1: **0** files there import
 Hono, `git grep -l 'from "hono' -- packages/daemon/src/adapters | wc -l`).
-`OmpRuntimeAdapter` (Oh My Pi) and `OmpTuiRuntimeAdapter` (Oh My Pi with its
-own native TUI) extend `PiRuntimeAdapter`, so the daemon wires **7** runtime
-keys — `claude-code`, `codex`, `pi`, `omp`, `omp-tui`, `stub`, `terminal`
+`OmpRuntimeAdapter` (Oh My Pi) extends `PiRuntimeAdapter`, and
+`OmpTuiRuntimeAdapter` (Oh My Pi with its own native TUI) extends
+`OmpRuntimeAdapter`, so the daemon wires **7** runtime keys — `claude-code`,
+`codex`, `pi`, `omp`, `omp-tui`, `stub`, `terminal`
 (`startup.ts:1067`, and the same map at `:1122`;
 `grep 'adapters: {' packages/daemon/src/startup.ts | grep -o -E '"[a-z-]+": ' | wc -l`).
 
