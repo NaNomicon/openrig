@@ -39,6 +39,24 @@ export interface OmpBridgeServerOptions {
 /** Commands queued for the bridge while it has not connected yet. */
 const MAX_PENDING_COMMANDS = 64;
 
+/** Probe an existing Unix socket without letting an unresponsive peer stall startup. */
+function isSocketServing(socketPath: string): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const socket = net.createConnection(socketPath);
+    let settled = false;
+    const finish = (serving: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(serving);
+    };
+    const timer = setTimeout(() => finish(false), 1000);
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+  });
+}
+
 /**
  * The bridge socket server. One instance per seat, owned by the runner.
  */
@@ -61,8 +79,14 @@ export class OmpBridgeServer {
     return this.pending.length;
   }
 
-  /** Start serving. Replaces a stale socket file left by a previous launch. */
+  /**
+   * Start serving. A stale socket file left by a previous launch is replaced;
+   * a socket that another live runner still serves is refused, not taken over.
+   */
   async start(): Promise<void> {
+    if (await isSocketServing(this.opts.socketPath)) {
+      throw new Error(`Another runner already serves socket ${this.opts.socketPath}`);
+    }
     const server = net.createServer((socket) => this.accept(socket));
     this.server = server;
     try {
